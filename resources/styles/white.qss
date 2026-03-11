@@ -1,71 +1,57 @@
-/* Основной фон */
-QWidget {
-    background-color: #ffffff;
-    color: #333333;
-    font-family: 'Segoe UI', Arial, sans-serif;
-    font-size: 12px;
-}
-
-/* Title Bar */
-CustomTitleBar {
+/* resources/styles/white.qss */
+QMainWindow {
     background-color: #f0f0f0;
-    border-bottom: 1px solid #cccccc;
 }
 
-CustomTitleBar QLabel {
+QWidget {
     color: #333333;
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 9pt; /* Уменьшен базовый размер */
 }
 
-CustomTitleBar QPushButton {
-    color: #333333;
-}
-
-CustomTitleBar QPushButton:hover {
-    background-color: #e0e0e0;
-}
-
-/* Кнопки */
 QPushButton {
-    background-color: #0078d4;
-    color: white;
-    border: none;
+    background-color: #e0e0e0;
+    border: 1px solid #cccccc;
     border-radius: 4px;
-    padding: 6px 12px;
+    padding: 4px 12px; /* Уменьшены отступы */
+    min-width: 80px;
+    max-height: 30px; /* Ограничение высоты */
 }
 
 QPushButton:hover {
-    background-color: #005a9e;
+    background-color: #d0d0d0;
 }
 
 QPushButton:pressed {
-    background-color: #004275;
+    background-color: #c0c0c0;
 }
 
-/* QListWidget (Патологии) */
-QListWidget {
-    background-color: #ffffff;
-    border: 1px solid #e0e0e0;
-    border-radius: 4px;
-}
-
-QListWidget::item {
-    padding: 5px;
-    border-bottom: 1px solid #f0f0f0;
-}
-
-QListWidget::item:selected {
-    background-color: #e5f3ff;
-    color: #000000;
-}
-
-/* ComboBox */
-QComboBox {
-    background-color: #ffffff;
+QComboBox, QListWidget {
+    background-color: white;
     border: 1px solid #cccccc;
     border-radius: 4px;
-    padding: 3px 10px;
+    padding: 2px 5px;
+    min-height: 20px;
 }
 
-QComboBox::drop-down {
-    border: none;
+QSplitter::handle {
+    background-color: #d0d0d0;
+    width: 2px;
+}
+
+QLabel {
+    color: #333333;
+}
+
+/* Прогресс бар */
+QProgressBar {
+    border: 1px solid grey;
+    border-radius: 5px;
+    text-align: center;
+    min-height: 15px;
+}
+
+QProgressBar::chunk {
+    background-color: #006666;
+    width: 20px;
 }

@@ -1,9 +1,12 @@
 import os
 
-# Базовый путь к проекту
+# Корневая директория проекта (Holter)
+# __file__ это .../Holter/app/__init__.py
+# dirname(__file__) -> .../Holter/app
+# dirname(dirname(__file__)) -> .../Holter
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESOURCES_DIR = os.path.join(BASE_DIR, 'resources')
-STYLES_DIR = os.path.join(RESOURCES_DIR, 'styles')
 
-# Частота дискретизации по умолчанию
-DEFAULT_SAMPLING_RATE = 360
+# ИСПРАВЛЕНО: Указываем путь через resources
+STYLES_DIR = os.path.join(BASE_DIR, 'resources', 'styles')
+MODELS_DIR = os.path.join(BASE_DIR, 'app', 'models')
+DB_DIR = os.path.join(BASE_DIR, 'DB')

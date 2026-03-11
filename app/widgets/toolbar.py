@@ -1,10 +1,9 @@
-# app/widgets/toolbar.py
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QPushButton, QComboBox, 
-                             QLabel, QSlider, QFileDialog, QMessageBox)
+                             QLabel, QFileDialog, QMessageBox)
 from PyQt5.QtCore import pyqtSignal, Qt
 
 class Toolbar(QWidget):
-    # Сигналы для взаимодействия с главным окном
+    # Сигналы
     open_file_clicked = pyqtSignal()
     lead_changed = pyqtSignal(int)
     style_changed = pyqtSignal(str)

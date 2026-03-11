@@ -1,4 +1,3 @@
-# app/core/ecg_processor.py
 import numpy as np
 from scipy import signal
 import neurokit2 as nk
@@ -7,11 +6,15 @@ class ECGProcessor:
     def __init__(self, fs=360):
         self.fs = fs
 
-    def filter_signal(self, raw_signal, lowcut=0.5, highcut=45.0):
+    def filter_signal(self, raw_signal, fs=None, lowcut=0.5, highcut=45.0):
         """
         Полосовая фильтрация.
+        Если fs передан, используется он, иначе значение из self.fs.
         """
-        nyquist = 0.5 * self.fs
+        # Используем переданную fs или дефолтную из экземпляра
+        current_fs = fs if fs is not None else self.fs
+        
+        nyquist = 0.5 * current_fs
         low = lowcut / nyquist
         high = highcut / nyquist
         
@@ -22,12 +25,15 @@ class ECGProcessor:
         filtered_signal = signal.filtfilt(b, a, raw_signal)
         return filtered_signal
 
-    def detect_r_peaks(self, ecg_signal):
+    def detect_r_peaks(self, ecg_signal, sampling_rate=None):
         """
         Детекция R-пиков.
         """
-        cleaned = nk.ecg_clean(ecg_signal, sampling_rate=self.fs, method="pantompkins1985")
-        signals, info = nk.ecg_peaks(cleaned, sampling_rate=self.fs, method="pantompkins1985")
+        # Используем переданную частоту или дефолтную
+        current_fs = sampling_rate if sampling_rate is not None else self.fs
+
+        cleaned = nk.ecg_clean(ecg_signal, sampling_rate=current_fs, method="pantompkins1985")
+        signals, info = nk.ecg_peaks(cleaned, sampling_rate=current_fs, method="pantompkins1985")
         r_peaks = info['ECG_R_Peaks']
         return r_peaks
 
