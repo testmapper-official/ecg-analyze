@@ -1,0 +1,7 @@
+venv
+__pycache__
+DB
+results
+processed_data
+*.log
+.vscode

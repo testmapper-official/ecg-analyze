@@ -1,0 +1,71 @@
+/* Основной фон */
+QWidget {
+    background-color: #ffffff;
+    color: #333333;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 12px;
+}
+
+/* Title Bar */
+CustomTitleBar {
+    background-color: #f0f0f0;
+    border-bottom: 1px solid #cccccc;
+}
+
+CustomTitleBar QLabel {
+    color: #333333;
+}
+
+CustomTitleBar QPushButton {
+    color: #333333;
+}
+
+CustomTitleBar QPushButton:hover {
+    background-color: #e0e0e0;
+}
+
+/* Кнопки */
+QPushButton {
+    background-color: #0078d4;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 12px;
+}
+
+QPushButton:hover {
+    background-color: #005a9e;
+}
+
+QPushButton:pressed {
+    background-color: #004275;
+}
+
+/* QListWidget (Патологии) */
+QListWidget {
+    background-color: #ffffff;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+}
+
+QListWidget::item {
+    padding: 5px;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+QListWidget::item:selected {
+    background-color: #e5f3ff;
+    color: #000000;
+}
+
+/* ComboBox */
+QComboBox {
+    background-color: #ffffff;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 3px 10px;
+}
+
+QComboBox::drop-down {
+    border: none;
+}

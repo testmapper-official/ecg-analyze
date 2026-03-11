@@ -1,0 +1,9 @@
+PyQt5
+wfdb
+pyedflib
+pyqtgraph
+numpy
+scipy
+neurokit2
+tensorflow
+pandas

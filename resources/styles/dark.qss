@@ -1,0 +1,37 @@
+QWidget {
+    background-color: #1a1a1a;
+    color: #ffffff;
+    font-family: 'Segoe UI', Arial, sans-serif;
+}
+
+CustomTitleBar {
+    background-color: #2a2a2a;
+    border-bottom: 1px solid #004444;
+}
+
+QPushButton {
+    background-color: #004444;
+    color: #ffffff;
+    border: none;
+    border-radius: 3px;
+    padding: 5px;
+}
+
+QPushButton:hover {
+    background-color: #006666;
+}
+
+QListWidget {
+    background-color: #2a2a2a;
+    border: 1px solid #004444;
+}
+
+QListWidget::item:selected {
+    background-color: #006666;
+}
+
+QComboBox {
+    background-color: #2a2a2a;
+    color: #ffffff;
+    border: 1px solid #004444;
+}
