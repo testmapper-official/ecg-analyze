@@ -89,12 +89,18 @@ class HolterClassifier:
         segment = signal_obj.get_segment(peak_idx, target_samples)
         if segment is None: return None, None, None
         
+        # --- Вход для PSS (Чистый, без TTA) ---
         pss_input = np.zeros((2, target_samples))
         pss_input[0, :] = segment
         pss_input[1, :] = rr_prev / 288.0 
         
-        temp_sig = Signal(data=segment, fs=360)
+        # --- Вход для BLK (С дизерингом/TTA для сохранения зазубрин) ---
+        # ФИКСИРУЕМ Зерно рандома по позиции пика! 
+        # Это гарантирует, что при повторном прогоне той же записи шум будет идентичным.
+        np.random.seed(peak_idx) 
         awgn_frag = np.random.normal(0, 1.0, target_samples)
+        
+        temp_sig = Signal(data=segment, fs=360)
         noisy_sig = temp_sig.add_noise(awgn_frag, snr_db_range=(25, 35))
         denoised_sig = noisy_sig.wavelet_denoise()
         denoised_sig.standardize()
@@ -107,8 +113,8 @@ class HolterClassifier:
         blk_input[1, :] = qrs_dur
         
         return torch.FloatTensor(pss_input).unsqueeze(0).to(self.device), \
-               torch.FloatTensor(blk_input).unsqueeze(0).to(self.device), \
-               qrs_dur
+            torch.FloatTensor(blk_input).unsqueeze(0).to(self.device), \
+            qrs_dur
 
     def analyze_signal(self, signal_obj: Signal):
         if not signal_obj.annotations: return [], []
@@ -157,26 +163,38 @@ class HolterClassifier:
         
         for i, pred in enumerate(raw_preds):
             rr_prev = rr_intervals[i]
+            rr_next = rr_intervals[i+1] if i+1 < len(rr_intervals) else median_rr
             qrs_dur = pred['qrs_dur']
             is_narrow = qrs_dur < wide_threshold 
             
             is_premature = rr_prev < (0.85 * median_rr)
-            is_delayed = rr_prev > (1.80 * median_rr) # Ужесточено для E
+            is_delayed = rr_prev > (1.80 * median_rr) 
             is_post_pvc = (i > 0 and raw_preds[i-1]['label'] in ['V', 'B', 'r', 'E'])
             
-            # 1. Сеть BLK доминирует, если уверена (Блокады не бывают преждевременными!)
+            # НОВОЕ: Проверка на интерполированность
+            total_rr = rr_prev + rr_next
+            is_interpolated = (1.7 * median_rr) <= total_rr <= (2.1 * median_rr)
+            
+            # 1. Сеть BLK доминирует
             if pred['prob_blk'] > self.blk_threshold and not is_premature:
                 pred['label'] = 'B'; continue
                 
-            # 2. Сеть PSS. РАЗРЕШЕНО забирать узкий комплекс, если ОЧЕНЬ уверена и удар преждевременный
+            # 2. Сеть PSS. Стандартная преждевременная V
             if pred['prob_pss'] > self.pss_threshold and is_premature:
+                pred['label'] = 'V'; continue
+                
+            # НОВОЕ: 2.1 Интерполированная V (Не преждевременная, но вставленная)
+            # Требуем высокой уверенности сети И попадания в физиологический диапазон паузы
+            if pred['prob_pss'] > 0.8 and is_interpolated:
                 pred['label'] = 'V'; continue
                 
             # 3. Escape
             thr = 2.20 * median_rr if is_post_pvc else 1.80 * median_rr
             if is_delayed and rr_prev > thr: 
-                pred['label'] = 'E'; continue
-                
+                # Проверяем, что комплекс широкий (желудочковый escape)
+                if not is_narrow:
+                    pred['label'] = 'E'; continue
+                    
             # 4. APC (Узкий + Преждевременный)
             if is_narrow and is_premature and rr_prev < (0.70 * median_rr): 
                 pred['label'] = 'A'; continue
@@ -189,90 +207,111 @@ class HolterClassifier:
     # 2. ДВИЖОК РИТМОВ (Скользящее окно 6 комплексов)
     # ---------------------------------------------------------
     def _apply_rhythm_engine(self, raw_preds, rr_intervals):
+        # Подготовка данных для универсального движка
+        seq = [{'sample': p['peak'], 'group': self._map_group(p['label'])} for p in raw_preds]
+        
+        # Вызов единого метода
+        detected_rhythms = self.detect_rhythms(seq)
+        
+        # Форматирование обратно в оригинальный формат классификатора
         rhythm_annotations = []
-        n = len(raw_preds)
+        for r in detected_rhythms:
+            rhythm_annotations.append({
+                'start_sample': r['start_sample'],
+                'end_sample': r['end_sample'],
+                'rhythm': f"({r['type']}" # Сохраняем оригинальный формат со скобкой
+            })
+            
+        return raw_preds, rhythm_annotations
+
+    @staticmethod
+    def _map_group(label):
+        """Маппинг меток в группы для универсального движка"""
+        # ДОБАВЛЕНА 'i' ДЛЯ ИНТЕРПОЛИРОВАННЫХ
+        if label in ['V', 'F', 'r', 'i', 'M', 'P']: return 'V'
+        if label in ['B', 'L', 'R']: return 'B'
+        if label in ['A', 'a']: return 'A'
+        if label == 'N': return 'N'
+        return 'O'
+
+    @staticmethod
+    def detect_rhythms(seq):
+        """
+        Единый универсальный движок поиска ритмов.
+        На вход: [{'sample': int, 'group': str (V, B, A, N)}]
+        На выход: [{'start_sample': int, 'end_sample': int, 'type': str (VT, Couplet, SB, Bigeminy, Trigeminy)}]
+        """
+        MAX_GAP_SEC = 2.0
+        rhythms = []
+        n = len(seq)
         i = 0
         
         while i < n:
-            # 1. TAХИКАРДИЯ (3+ V подряд)
-            if raw_preds[i]['label'] == 'V':
-                v_run_start = i
-                while i < n and raw_preds[i]['label'] in ['V', 'r', 'i', 'M', 'P']:
-                    i += 1
-                if i - v_run_start >= 3:
-                    # Смотрим соседей для самокоррекции (снижаем порог)
-                    if v_run_start > 0 and raw_preds[v_run_start-1]['label'] == 'N' and raw_preds[v_run_start-1]['prob_pss'] > 0.3:
-                        raw_preds[v_run_start-1]['label'] = 'V'
-                        v_run_start -= 1
-                    while i < n and raw_preds[i]['label'] == 'N' and raw_preds[i]['prob_pss'] > 0.3:
-                        raw_preds[i]['label'] = 'V'
-                        i += 1
-                        
-                    rhythm_annotations.append({
-                        'start_sample': raw_preds[v_run_start]['peak'], 
-                        'end_sample': raw_preds[i-1]['peak'], 
-                        'rhythm': '(V' 
-                    })
+            # 1. ТАХИКАРДИЯ / ПАРНАЯ (2+ V подряд)
+            if seq[i]['group'] == 'V':
+                start = i
+                while i < n and seq[i]['group'] == 'V': i += 1
+                count = i - start
+                
+                if count >= 2:
+                    r_type = 'VT' if count >= 3 else 'Couplet'
+                    s_s, e_s = seq[start]['sample'], seq[i-1]['sample']
+                    
+                    # Слияние близких ритмов
+                    if rhythms and rhythms[-1]['type'] == r_type:
+                        prev_end = rhythms[-1]['end_sample']
+                        if (s_s - prev_end) / 360.0 <= MAX_GAP_SEC:
+                            rhythms[-1]['end_sample'] = e_s
+                            continue
+                            
+                    rhythms.append({'start_sample': s_s, 'end_sample': e_s, 'type': r_type})
                 continue
                 
             # 2. СТАБИЛЬНАЯ БЛОКАДА (3+ B подряд)
-            if raw_preds[i]['label'] == 'B':
-                b_run_start = i
-                while i < n and raw_preds[i]['label'] == 'B':
-                    i += 1
-                if i - b_run_start >= 3:
-                    if b_run_start > 0 and raw_preds[b_run_start-1]['label'] == 'N' and raw_preds[b_run_start-1]['prob_blk'] > 0.3:
-                        raw_preds[b_run_start-1]['label'] = 'B'
-                        b_run_start -= 1
-                    while i < n and raw_preds[i]['label'] == 'N' and raw_preds[i]['prob_blk'] > 0.3:
-                        raw_preds[i]['label'] = 'B'
-                        i += 1
-                        
-                    rhythm_annotations.append({
-                        'start_sample': raw_preds[b_run_start]['peak'], 
-                        'end_sample': raw_preds[i-1]['peak'], 
-                        'rhythm': '(BLK'
-                    })
+            elif seq[i]['group'] == 'B':
+                start = i
+                while i < n and seq[i]['group'] == 'B': i += 1
+                count = i - start
+                
+                if count >= 3:
+                    s_s, e_s = seq[start]['sample'], seq[i-1]['sample']
+                    if rhythms and rhythms[-1]['type'] == 'SB':
+                        prev_end = rhythms[-1]['end_sample']
+                        if (s_s - prev_end) / 360.0 <= MAX_GAP_SEC:
+                            rhythms[-1]['end_sample'] = e_s
+                            continue
+                    rhythms.append({'start_sample': s_s, 'end_sample': e_s, 'type': 'SB'})
                 continue
                 
             # 3. БИГЕМИНИЯ И ТРИГЕМИНИЯ (Окно 6)
-            if i + 5 < n:
-                window = [raw_preds[j]['label'] for j in range(i, i+6)]
+            elif i + 5 < n:
+                window = [seq[j]['group'] for j in range(i, i+6)]
+                is_b = (window == ['N', 'V', 'N', 'V', 'N', 'V'])
+                is_t = (window == ['N', 'N', 'V', 'N', 'N', 'V'])
                 
-                is_bigeminy = (window == ['N', 'V', 'N', 'V', 'N', 'V'])
-                is_trigeminy = (window == ['N', 'N', 'V', 'N', 'N', 'V'])
-                
-                if is_bigeminy or is_trigeminy:
-                    rhythm_type = '(B' if is_bigeminy else '(T'
-                    start_sample = raw_preds[i]['peak']
+                if is_b or is_t:
+                    r_type = 'Bigeminy' if is_b else 'Trigeminy'
+                    s_s = seq[i]['sample']
                     j = i + 6
+                    step = 2 if is_b else 3
                     
-                    # Расширяем паттерн вперед
-                    if is_bigeminy:
-                        while j + 1 < n:
-                            if raw_preds[j]['label'] == 'N' and raw_preds[j+1]['label'] == 'V':
-                                j += 2
-                            elif raw_preds[j]['label'] == 'N' and raw_preds[j+1]['label'] == 'N' and raw_preds[j+1]['prob_pss'] > 0.3:
-                                raw_preds[j+1]['label'] = 'V' # Снижаем порог для ожидаемой V
-                                j += 2
-                            else: break
-                    elif is_trigeminy:
-                        while j + 2 < n:
-                            if raw_preds[j]['label'] == 'N' and raw_preds[j+1]['label'] == 'N' and raw_preds[j+2]['label'] == 'V':
-                                j += 3
-                            elif raw_preds[j]['label'] == 'N' and raw_preds[j+1]['label'] == 'N' and raw_preds[j+2]['label'] == 'N' and raw_preds[j+2]['prob_pss'] > 0.3:
-                                raw_preds[j+2]['label'] = 'V' # Снижаем порог для ожидаемой V
-                                j += 3
-                            else: break
+                    while j + step - 1 < n:
+                        ch = [seq[k]['group'] for k in range(j, j+step)]
+                        if (is_b and ch == ['N', 'V']) or (is_t and ch == ['N', 'N', 'V']): j += step
+                        else: break
                     
-                    end_sample = raw_preds[j-1]['peak']
-                    rhythm_annotations.append({'start_sample': start_sample, 'end_sample': end_sample, 'rhythm': rhythm_type})
-                    i = j # Перепрыгиваем обработанный кусок
-                    continue
-                    
-            i += 1
+                    e_s = seq[j-1]['sample']
+                    if rhythms and rhythms[-1]['type'] == r_type:
+                        prev_end = rhythms[-1]['end_sample']
+                        if (s_s - prev_end) / 360.0 <= MAX_GAP_SEC:
+                            rhythms[-1]['end_sample'] = e_s
+                            i = j; continue
+                            
+                    rhythms.append({'start_sample': s_s, 'end_sample': e_s, 'type': r_type})
+                    i = j; continue
             
-        return raw_preds, rhythm_annotations
+            i += 1
+        return rhythms
 
     # ---------------------------------------------------------
     # 3. Отмена одиночных Блокад

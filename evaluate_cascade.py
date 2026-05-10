@@ -11,7 +11,6 @@ import seaborn as sns
 
 from app.core.signal import Signal
 from app.core.holter_classifier import HolterClassifier
-from app.training.ii.dataset import DatasetBuilder
 
 # Маппинг оригинальных символов БД в наши макро-классы
 DB_SYMBOL_TO_CLASS = {
@@ -33,6 +32,64 @@ PRED_TO_CLASS = {
 VAL_CLASSES = ['N', 'A', 'B', 'E', 'V']
 TARGET_VAL_COUNT = 750
 
+def load_test_patients(db_root):
+    """Загружает ID пациентов из тестовых выборок BLK и PSS"""
+    splits_dir = os.path.join(db_root, 'splits')
+    blk_test_patients = set()
+    pss_test_patients = set()
+    
+    blk_test_path = os.path.join(splits_dir, 'blk_test.txt')
+    pss_test_path = os.path.join(splits_dir, 'pss_test.txt')
+    
+    if os.path.exists(blk_test_path):
+        with open(blk_test_path, 'r') as f:
+            for line in f:
+                pid = line.strip()
+                if pid: blk_test_patients.add(pid)
+    else:
+        print(f"ПРЕДУПРЕЖДЕНИЕ: Файл {blk_test_path} не найден. Сначала обучите BLK модель.")
+        
+    if os.path.exists(pss_test_path):
+        with open(pss_test_path, 'r') as f:
+            for line in f:
+                pid = line.strip()
+                if pid: pss_test_patients.add(pid)
+    else:
+        print(f"ПРЕДУПРЕЖДЕНИЕ: Файл {pss_test_path} не найден. Сначала обучите PSS модель.")
+        
+    return blk_test_patients, pss_test_patients
+
+def load_noise_data(db_root):
+    """Загружает физиологический шум из NSTDB для зашумления тестовой выборки"""
+    nstdb_path = os.path.join(db_root, 'nstdb')
+    noises = {}
+    for n_type in ['em', 'ma']:
+        try:
+            rec = wfdb.rdrecord(os.path.join(nstdb_path, n_type))
+            if rec.fs != 360:
+                 noises[n_type] = Signal(data=rec.p_signal[:, 0], fs=rec.fs).resampled_data
+            else:
+                 noises[n_type] = rec.p_signal[:, 0]
+        except Exception as e:
+            print(f"ОШИБКА ЗАГРУЗКИ ШУМА {n_type}: {e}")
+    return noises
+
+def add_noise_to_signal(sig_obj, noise_data, snr_db_range=(-3, 12)):
+    """Накладывает шум на весь сигнал целиком, затем фильтрует и нормализует"""
+    if not noise_data or len(sig_obj.resampled_data) == 0:
+        return sig_obj
+        
+    # Выбираем случайный тип шума (em или ma)
+    n_type = np.random.choice(list(noise_data.keys()))
+    noise_base = noise_data[n_type]
+    
+    # Метод add_noise внутри класса Signal сам заботится о нарезке/зацикливании шума
+    noisy_sig = sig_obj.add_noise(noise_base, snr_db_range=snr_db_range)
+    noisy_sig = noisy_sig.wavelet_denoise()
+    noisy_sig.standardize()
+    
+    return noisy_sig
+
 def calculate_rhythm_confidence(sig_obj, start_sample, end_sample, rhythm_type):
     """Считает % истинных меток в эпизоде, подтверждающих ритм"""
     true_in_span = [ann['symbol'] for ann in sig_obj.annotations 
@@ -46,18 +103,21 @@ def calculate_rhythm_confidence(sig_obj, start_sample, end_sample, rhythm_type):
     else: matches = 0
     return (matches / len(true_in_span)) * 100.0
 
-def evaluate_cascade_validation(classifier, records, db_root, results_dir):
-    """Сбор 750 примеров на класс и оценка каскада + генерация Markdown по ритмам"""
+def evaluate_cascade_validation(classifier, records, db_root, results_dir, blk_test_patients, pss_test_patients, noise_data):
+    """Сбор 750 примеров на класс (чистые + зашумленные) и оценка каскада"""
     md_path = os.path.join(results_dir, "validation_and_rhythms.md")
     
-    # Счетчики и хранилища для валидации
+    # Счетчики для валидации (одни на двоих, так как набор истинных классов один)
     val_counts = {cls: 0 for cls in VAL_CLASSES}
-    y_true_val, y_pred_val = [], []
+    
+    # Раздельные хранилища для предсказаний
+    y_true_clean, y_pred_clean = [], []
+    y_pred_noisy = []
     
     # Хранилище для ритмов
     rhythms_data = defaultdict(list)
     
-    print(f"\n=== ВАЛИДАЦИЯ КАСКАДА (Цель: {TARGET_VAL_COUNT} на класс) + РИТМЫ ===")
+    print(f"\n=== ВАЛИДАЦИЯ КАСКАДА (Цель: {TARGET_VAL_COUNT} на класс) + ЗАШУМЛЕНИЕ ===")
     
     with open(md_path, 'w', encoding='utf-8') as md_file:
         md_file.write("# Валидация каскадного классификатора и Отчет по ритмам\n\n")
@@ -71,13 +131,27 @@ def evaluate_cascade_validation(classifier, records, db_root, results_dir):
             # Проверяем, не набрали ли мы уже все 5 классов
             if all(count >= TARGET_VAL_COUNT for count in val_counts.values()):
                 break
+            
+            # Определяем ID пациента для текущей записи
+            parts = rec_path.split('/')
+            patient_id = parts[1] if len(parts) > 1 else None
                 
             print(f"  Обработка: {rec_path}")
             try:
                 sig = Signal(record_path=full_path)
+                sig.standardize()
+                
+                # 1. Получаем предсказания для чистого сигнала
                 results_clean, rhythms = classifier.analyze_signal(sig)
                 
-                # 1. Собираем ритмы в Markdown
+                # 2. Создаем зашумленный сигнал и получаем предсказания для него
+                if noise_data:
+                    noisy_sig = add_noise_to_signal(sig, noise_data, snr_db_range=(-3, 12))
+                    results_noisy, _ = classifier.analyze_signal(noisy_sig)
+                else:
+                    results_noisy = results_clean # Если шума нет, предсказания одинаковы
+                
+                # 3. Собираем ритмы в Markdown (только по чистому сигналу)
                 for rhy in rhythms:
                     start_sec = rhy['start_sample'] / 360.0
                     end_sec = rhy['end_sample'] / 360.0
@@ -86,8 +160,9 @@ def evaluate_cascade_validation(classifier, records, db_root, results_dir):
                         'record': rec_path, 'start': start_sec, 'end': end_sec, 'conf': conf
                     })
                 
-                # 2. Собираем валидационную выборку
-                pred_map = {r['sample']: r['label'] for r in results_clean}
+                # 4. Собираем валидационную выборку
+                pred_map_clean = {r['sample']: r['label'] for r in results_clean}
+                pred_map_noisy = {r['sample']: r['label'] for r in results_noisy}
                 
                 for ann in sig.annotations:
                     true_sym = ann['symbol'].upper()
@@ -98,22 +173,38 @@ def evaluate_cascade_validation(classifier, records, db_root, results_dir):
                     # Если уже набрали 750 для этого класса, пропускаем
                     if val_counts[true_cls] >= TARGET_VAL_COUNT: continue
                     
-                    peak = ann['sample']
-                    pred_sym = pred_map.get(peak, 'N')
-                    pred_cls = PRED_TO_CLASS.get(pred_sym, 'N')
+                    # ПРАВИЛА ФИЛЬТРАЦИИ ПОЛЬЗОВАТЕЛЯ:
+                    if true_cls == 'B' and patient_id not in blk_test_patients:
+                        continue
+                    if true_cls == 'V' and patient_id not in pss_test_patients:
+                        continue
                     
-                    y_true_val.append(true_cls)
-                    y_pred_val.append(pred_cls)
+                    peak = ann['sample']
+                    
+                    # Чистые предсказания
+                    pred_sym_clean = pred_map_clean.get(peak, 'N')
+                    pred_cls_clean = PRED_TO_CLASS.get(pred_sym_clean, 'N')
+                    
+                    # Зашумленные предсказания
+                    pred_sym_noisy = pred_map_noisy.get(peak, 'N')
+                    pred_cls_noisy = PRED_TO_CLASS.get(pred_sym_noisy, 'N')
+                    
+                    # Сохраняем результаты (истинный класс один и тот же)
+                    y_true_clean.append(true_cls)
+                    y_pred_clean.append(pred_cls_clean)
+                    y_pred_noisy.append(pred_cls_noisy)
+                    
                     val_counts[true_cls] += 1
                     
-            except Exception as e: pass
+            except Exception as e: 
+                print(f"Ошибка при обработке {rec_path}: {e}")
             
         # Запись прогресса сбора в Markdown
         for cls in VAL_CLASSES:
             md_file.write(f"- **{cls}**: собрано {val_counts[cls]} / {TARGET_VAL_COUNT}\n")
         md_file.write("\n")
 
-        # 3. Запись ритмов в Markdown
+        # Запись ритмов в Markdown
         md_file.write("## 2. Детекция ритмов\n\n")
         for rhythm_type, episodes in rhythms_data.items():
             md_file.write(f"### Ритм: {rhythm_type}\n\n")
@@ -123,134 +214,28 @@ def evaluate_cascade_validation(classifier, records, db_root, results_dir):
                 md_file.write(f"| {ep['record']} | {ep['start']:.2f} | {ep['end']:.2f} | {ep['conf']:.1f} |\n")
             md_file.write("\n")
 
-    # 4. Вычисление метрик и построение матрицы ошибок валидации
-    print("\nРасчет метрик валидации...")
-    print(classification_report(y_true_val, y_pred_val, labels=VAL_CLASSES, zero_division=0))
+    # 5. Вычисление метрик и построение матриц ошибок
+    print("\nРасчет метрик для ЧИСТЫХ данных...")
+    print(classification_report(y_true_clean, y_pred_clean, labels=VAL_CLASSES, zero_division=0))
     
-    cm = confusion_matrix(y_true_val, y_pred_val, labels=VAL_CLASSES)
+    cm_clean = confusion_matrix(y_true_clean, y_pred_clean, labels=VAL_CLASSES)
     plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=VAL_CLASSES, yticklabels=VAL_CLASSES)
-    plt.title(f"Balanced Validation Cascade ({TARGET_VAL_COUNT}/cls)")
+    sns.heatmap(cm_clean, annot=True, fmt='d', cmap='Blues', xticklabels=VAL_CLASSES, yticklabels=VAL_CLASSES)
+    plt.title(f"Clean Validation Cascade ({TARGET_VAL_COUNT}/cls)")
     plt.ylabel('True Label'); plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "validation_cascade_cm.png"), dpi=150); plt.close()
+    plt.savefig(os.path.join(results_dir, "validation_cascade_cm_clean.png"), dpi=150); plt.close()
 
-def evaluate_rount_mitdb(classifier, db_root, results_dir):
-    """Оценка R-on-T на MIT-BIH Arrhythmia DB"""
-    mitdb_path = os.path.join(db_root, 'mitdb')
-    if not os.path.exists(mitdb_path):
-        print("Папка mitdb не найдена, оценка R-on-T пропущена."); return
-        
-    print("\n=== ОЦЕНКА R-ON-T (MIT-BIH) ===")
-    records = [f.split('.')[0] for f in os.listdir(mitdb_path) if f.endswith('.dat')]
+    print("\nРасчет метрик для ЗАШУМЛЕННЫХ данных...")
+    print(classification_report(y_true_clean, y_pred_noisy, labels=VAL_CLASSES, zero_division=0))
     
-    y_true, y_pred = [], []
-    
-    for rec in records:
-        full_path = os.path.join(mitdb_path, rec)
-        try:
-            ann = wfdb.rdann(full_path, 'atr')
-            if 'r' not in [s.upper() for s in ann.symbol]: continue
-                
-            print(f"  Анализ R-on-T: {rec}")
-            sig = Signal(record_path=full_path)
-            results, _ = classifier.analyze_signal(sig)
-            
-            pred_map = {r['sample']: r['label'] for r in results}
-            
-            for i, sym in enumerate(ann.symbol):
-                sym = sym.upper()
-                if sym == 'R':
-                    peak = ann.sample[i]
-                    pred_label = pred_map.get(peak, 'N')
-                    y_true.append('r')
-                    y_pred.append(PRED_TO_CLASS.get(pred_label, 'N'))
-        except: pass
-
-    if not y_true:
-        print("Не найдено записей с меткой 'r' в mitdb!"); return
-
-    print("\nОтчет по R-on-T (MIT-BIH):")
-    print(classification_report(y_true, y_pred, labels=['r', 'V', 'N'], zero_division=0))
-    
-    cm = confusion_matrix(y_true, y_pred, labels=['r', 'V', 'N'])
-    plt.figure(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Reds', xticklabels=['r', 'V', 'N'], yticklabels=['r', 'V', 'N'])
-    plt.title("R-on-T Detection (MIT-BIH)"); plt.ylabel('True'); plt.xlabel('Pred')
-    plt.savefig(os.path.join(results_dir, "rount_mitdb_cm.png"), dpi=150); plt.close()
-
-def evaluate_rount_sddb(classifier, db_root, results_dir):
-    """Оценка R-on-T и V на Sudden Cardiac Death DB"""
-    sddb_path = os.path.join(db_root, 'sddb')
-    if not os.path.exists(sddb_path):
-        print("Папка sddb не найдена, оценка пропущена."); return
-        
-    print("\n=== ОЦЕНКА V и R-ON-T (SDDB) ===")
-    records = [f.split('.')[0] for f in os.listdir(sddb_path) if f.endswith('.dat')]
-    
-    total_v_true = 0; total_v_pred = 0
-    total_rount_true = 0; total_rount_pred = 0
-    has_true_rount = False
-    
-    for rec in records:
-        full_path = os.path.join(sddb_path, rec)
-        try:
-            ann = wfdb.rdann(full_path, 'atr')
-            symbols = [s.upper() for s in ann.symbol]
-            
-            if 'R' in symbols: has_true_rount = True
-                
-            v_true_count = sum(1 for s in symbols if s == 'V')
-            r_true_count = sum(1 for s in symbols if s == 'R')
-            total_v_true += v_true_count
-            total_rount_true += r_true_count
-            
-            print(f"  Анализ SDDB: {rec}")
-            sig = Signal(record_path=full_path)
-            results, _ = classifier.analyze_signal(sig)
-            
-            v_pred_count = sum(1 for r in results if r['label'] in ['V', 'r', 'i', 'M', 'P'])
-            rount_pred_count = sum(1 for r in results if r['label'] == 'r')
-            total_v_pred += v_pred_count
-            total_rount_pred += rount_pred_count
-            
-        except: pass
-
-    print("\n--- Статистика SDDB ---")
-    print(f"Всего истинных ПЖС (V): {total_v_true}")
-    print(f"Всего найдено ПЖС (V+подтипы): {total_v_pred}")
-    print(f"Всего истинных R-on-T (r): {total_rount_true}")
-    print(f"Всего найдено R-on-T (r): {total_rount_pred}")
-    
-    if total_v_pred > 0:
-        rount_percent = (total_rount_pred / total_v_pred) * 100
-        print(f"Процент R-on-T от найденных ПЖС: {rount_percent:.2f}%")
-    else: print("ПЖС не найдено.")
-        
-    if has_true_rount:
-        print("Внимание: В SDDB есть истинные метки 'r'. Строим матрицу ошибок.")
-        y_true, y_pred = [], []
-        for rec in records:
-            full_path = os.path.join(sddb_path, rec)
-            try:
-                ann = wfdb.rdann(full_path, 'atr')
-                sig = Signal(record_path=full_path)
-                results, _ = classifier.analyze_signal(sig)
-                pred_map = {r['sample']: r['label'] for r in results}
-                for i, sym in enumerate(ann.symbol):
-                    sym = sym.upper()
-                    if sym in ['V', 'R']:
-                        peak = ann.sample[i]
-                        pred_label = pred_map.get(peak, 'N')
-                        y_true.append(sym)
-                        y_pred.append(PRED_TO_CLASS.get(pred_label, 'N'))
-            except: pass
-            
-        cm = confusion_matrix(y_true, y_pred, labels=['V', 'R', 'N'])
-        plt.figure(figsize=(5, 4))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['V', 'r', 'N'], yticklabels=['V', 'r', 'N'])
-        plt.title("V vs R-on-T (SDDB)"); plt.ylabel('True'); plt.xlabel('Pred')
-        plt.savefig(os.path.join(results_dir, "rount_sddb_cm.png"), dpi=150); plt.close()
+    cm_noisy = confusion_matrix(y_true_clean, y_pred_noisy, labels=VAL_CLASSES)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm_noisy, annot=True, fmt='d', cmap='Reds', xticklabels=VAL_CLASSES, yticklabels=VAL_CLASSES)
+    plt.title(f"Noisy Validation Cascade ({TARGET_VAL_COUNT}/cls)")
+    plt.ylabel('True Label'); plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_dir, "validation_cascade_cm_noisy.png"), dpi=150); plt.close()
 
 def evaluate_pipeline(db_root='DB', results_dir='results/Cascade'):
     os.makedirs(results_dir, exist_ok=True)
@@ -262,14 +247,27 @@ def evaluate_pipeline(db_root='DB', results_dir='results/Cascade'):
     records_file = os.path.join(mydb_path, 'RECORDS')
     
     if os.path.exists(records_file):
-        with open(records_file, 'r') as f:
-            # Берем все записи, чтобы набрать 750 редких классов
-            records = [line.strip() for line in f if line.strip() and line.strip().startswith('II/')]
-            
-        evaluate_cascade_validation(classifier, records, mydb_path, results_dir)
+        blk_test_patients, pss_test_patients = load_test_patients(db_root)
+        print(f"Тестовых пациентов BLK: {len(blk_test_patients)} | PSS: {len(pss_test_patients)}")
         
-    # evaluate_rount_mitdb(classifier, db_root, results_dir)
-    # evaluate_rount_sddb(classifier, db_root, results_dir)
+        # Загружаем данные шума
+        noise_data = load_noise_data(db_root)
+        
+        allowed_patients = blk_test_patients.union(pss_test_patients)
+        
+        with open(records_file, 'r') as f:
+            all_records = [line.strip() for line in f if line.strip() and line.strip().startswith('II/')]
+        
+        independent_records = []
+        for rec in all_records:
+            parts = rec.split('/')
+            if len(parts) > 1:
+                patient_id = parts[1]
+                if patient_id in allowed_patients:
+                    independent_records.append(rec)
+        
+        print(f"Всего записей в БД: {len(all_records)}. Записей для независимого теста каскада: {len(independent_records)}")
+        evaluate_cascade_validation(classifier, independent_records, mydb_path, results_dir, blk_test_patients, pss_test_patients, noise_data)
     
     print("\nВсе оценки завершены!")
 

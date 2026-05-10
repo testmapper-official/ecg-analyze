@@ -13,7 +13,7 @@ TARGET_TRAIN = 7000  # 3500 Normal + 3500 PSS
 TARGET_VAL = 1500    # 750 Normal + 750 PSS 
 TARGET_TEST = 1500   # 750 Normal + 750 PSS
 
-AUGMENTATION_PERCENT = 0.75 # 75% от суммарного норматива (добавит 5250 аугментаций к 7000 базе)
+AUGMENTATION_PERCENT = 0.75
 
 # СТРОГАЯ ФИЛЬТРАЦИЯ
 NORMAL_SYMBOLS = ['N', 'E', 'A']
@@ -25,6 +25,9 @@ class DatasetBuilder:
         self.mydb_path = os.path.join(db_root, 'mydb')
         self.nstdb_path = os.path.join(db_root, 'nstdb')
         self.noise_data = self._load_nstdb()
+        # Создаем папку для сохранения разделений
+        self.splits_dir = os.path.join(db_root, 'splits')
+        os.makedirs(self.splits_dir, exist_ok=True)
 
     def _load_nstdb(self):
         noises = {}
@@ -39,6 +42,12 @@ class DatasetBuilder:
             except Exception as e:
                 print(f"ОШИБКА ЗАГРУЗКИ ШУМА {n_type}: {e}")
         return noises
+
+    def _save_split(self, patient_list, filename):
+        filepath = os.path.join(self.splits_dir, filename)
+        with open(filepath, 'w') as f:
+            for pid in patient_list:
+                f.write(f"{pid}\n")
 
     def build(self):
         patients_data = self._collect_data()
@@ -105,6 +114,11 @@ class DatasetBuilder:
         val_patients = pss_val + norm_val
         test_patients = pss_test + norm_test
 
+        # Сохраняем разделения для каскада
+        self._save_split(train_patients, 'pss_train.txt')
+        self._save_split(val_patients, 'pss_val.txt')
+        self._save_split(test_patients, 'pss_test.txt')
+
         X_train, y_train, sym_train = self._balance_split(patients_data, train_patients, TARGET_TRAIN, is_train=True)
         X_val, y_val, sym_val = self._balance_split(patients_data, val_patients, TARGET_VAL, is_train=False)
         X_test, y_test, sym_test = self._balance_split(patients_data, test_patients, TARGET_TEST, is_train=False)
@@ -124,7 +138,7 @@ class DatasetBuilder:
             raise ValueError(f"Недостаточно данных ПСС или Нормы для формирования выборки!")
             
         sampled_pss_idx = np.random.choice(len(pss), num_per_class, replace=False)
-        sampled_norm_idx = np.random.choice(len(normals), num_per_class, replace=True) # replace=True чтобы не падать
+        sampled_norm_idx = np.random.choice(len(normals), num_per_class, replace=True)
         
         final_data = [pss[i] for i in sampled_pss_idx] + [normals[i] for i in sampled_norm_idx]
         np.random.shuffle(final_data)
@@ -147,27 +161,15 @@ class DatasetBuilder:
             
         return torch.FloatTensor(X), y, sym
 
-    # НОВЫЙ МЕТОД: Генерация диверсифицированного шума
     def _get_random_noise_segment(self, length):
         noise_types = list(self.noise_data.keys())
         if not noise_types:
             return np.zeros(length)
             
-        # Расширенные стратегии:
-        # 20% - Чистый физиологический (мышцы/электрод)
-        # 10% - Смесь физиологий
-        # 10% - Чистый приборный БГШ
-        # 10% - Смесь Физиология + БГШ
-        # 15% - Сетевая наводка 50 Гц
-        # 15% - Прострел электрода (Pop)
-        # 10% - Модуляция дыханием (возвращаем мультипликативный шум, единицы)
-        # 10% - Клиппинг (возвращаем специальный флаг, обработаем вне)
-        
-        # Для простоты вернем аддитивные шумы, а мультипликативные/нелинейные сделаем отдельным методом
         strategy = np.random.choice([
             'pure', 'mixed_physio', 'awgn', 'mixed_total', 
             'powerline', 'pop'
-        ], p=[0.2, 0.1, 0.1, 0.1, 0.2, 0.3]) # Повышаем шанс на самые опасные: 50Hz и Pop
+        ], p=[0.2, 0.1, 0.1, 0.1, 0.2, 0.3])
             
         if strategy == 'pure' or len(noise_types) == 1:
             n_type = np.random.choice(noise_types)
@@ -198,23 +200,19 @@ class DatasetBuilder:
             return w1 * physio_frag + (1.0 - w1) * awgn_frag
             
         elif strategy == 'powerline':
-            # 50 Гц (или 60 Гц) сетевая наводка
             freq = np.random.choice([50.0, 60.0])
             phase = np.random.uniform(0, 2 * np.pi)
             t = np.arange(length) / TARGET_FS
-            # Генерируем чистую синусоиду (амплитуду подгонит add_noise)
             return np.sin(2 * np.pi * freq * t + phase)
             
         elif strategy == 'pop':
-            # "Прострел" электрода: резкий spike + экспоненциальный спад
             noise = np.zeros(length)
-            pop_idx = np.random.randint(length // 4, 3 * length // 4) # Где-то в середине окна
+            pop_idx = np.random.randint(length // 4, 3 * length // 4)
             amplitude = np.random.choice([-1, 1]) * np.random.uniform(3.0, 10.0)
             decay_rate = np.random.uniform(0.01, 0.05)
             
             noise[pop_idx] = amplitude
             if pop_idx + 1 < length:
-                # Экспоненциальный спад после скачка
                 tail_len = length - pop_idx - 1
                 noise[pop_idx+1:] = amplitude * np.exp(-decay_rate * np.arange(tail_len))
             return noise
@@ -227,23 +225,19 @@ class DatasetBuilder:
             item = base_data[idx]
             temp_sig = Signal(data=item['segment'], fs=TARGET_FS)
             
-            # 1. Искажения морфологии (ДО добавления шума)
-            if np.random.rand() < 0.3: # 30% шанс модуляции дыханием
+            if np.random.rand() < 0.3:
                 temp_sig = temp_sig.respiratory_modulation()
-            if np.random.rand() < 0.1: # 10% шанс клиппинга АЦП
+            if np.random.rand() < 0.1:
                 temp_sig = temp_sig.adc_clipping()
                 
-            # 2. Временной сдвиг
             shifted_sig = temp_sig.time_shift(max_shift_ms=30)
             
-            # 3. Наложение шума
             if self.noise_data:
                 noise_frag = self._get_random_noise_segment(SEGMENT_SAMPLES)
                 augmented_sig = shifted_sig.add_noise(noise_frag, snr_db_range=(-12, 6))
             else:
                 augmented_sig = shifted_sig
             
-            # 4. Вейвлет-фильтрация и нормализация
             denoised_sig = augmented_sig.wavelet_denoise()
             denoised_sig.standardize()
             
@@ -264,26 +258,21 @@ class DatasetBuilder:
         return np.array(X_aug), np.array(y_aug), np.array(sym_aug)
     
     def generate_noisy_test_set(self, X_test, y_test, sym_test):
-        """Создает копию тестовой выборки, но сильно зашумленную"""
         X_noisy = torch.zeros_like(X_test)
         
         for i in range(X_test.shape[0]):
             segment = X_test[i, 0, :].numpy()
             rr_norm = X_test[i, 1, 0].item()
             
-            # Создаем сигнал из окна
             temp_sig = Signal(data=segment, fs=TARGET_FS)
-            shifted_sig = temp_sig.time_shift(max_shift_ms=20) # Слегка сдвигаем
+            shifted_sig = temp_sig.time_shift(max_shift_ms=20)
             
-            # В методе generate_noisy_test_set замените блок if self.noise_data:
             if self.noise_data:
-                # Генерируем композитный/случайный шум для теста
                 noise_frag = self._get_random_noise_segment(SEGMENT_SAMPLES)
                 augmented_sig = shifted_sig.add_noise(noise_frag, snr_db_range=(-12, 6))
             else:
                 augmented_sig = shifted_sig
                 
-            # Обязательно применяем вейвлет, как при обучении
             denoised_sig = augmented_sig.wavelet_denoise()
             denoised_sig.standardize()
             
@@ -294,7 +283,7 @@ class DatasetBuilder:
                 X_noisy[i, 0, :] = torch.FloatTensor(aug_seg)
                 X_noisy[i, 1, :] = rr_norm
             else:
-                X_noisy[i] = X_test[i] # Fallback
+                X_noisy[i] = X_test[i]
                 
             del temp_sig, shifted_sig, augmented_sig, denoised_sig
             

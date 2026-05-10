@@ -24,6 +24,9 @@ class DatasetBuilder:
         self.mydb_path = os.path.join(db_root, 'mydb')
         self.nstdb_path = os.path.join(db_root, 'nstdb')
         self.noise_data = self._load_nstdb()
+        # Создаем папку для сохранения разделений
+        self.splits_dir = os.path.join(db_root, 'splits')
+        os.makedirs(self.splits_dir, exist_ok=True)
 
     def _load_nstdb(self):
         noises = {}
@@ -36,6 +39,12 @@ class DatasetBuilder:
                      noises[n_type] = rec.p_signal[:, 0]
             except: pass
         return noises
+
+    def _save_split(self, patient_list, filename):
+        filepath = os.path.join(self.splits_dir, filename)
+        with open(filepath, 'w') as f:
+            for pid in patient_list:
+                f.write(f"{pid}\n")
 
     def build(self):
         patients_data = self._collect_data()
@@ -74,7 +83,6 @@ class DatasetBuilder:
                 segment = sig.get_segment(peak, SEGMENT_SAMPLES)
                 
                 if segment is not None:
-                    # СЧИТАЕМ ДЛИТЕЛЬНОСТЬ QRS ИЗ ЧИСТОГО СИГНАЛА
                     qrs_dur = sig.get_qrs_duration_norm(segment)
                     
                     patients_data[patient_id].append({
@@ -82,7 +90,7 @@ class DatasetBuilder:
                         'label': label,
                         'original_symbol': sym,
                         'rr_norm': rr_norm,
-                        'qrs_dur': qrs_dur # ДОБАВЛЕНО
+                        'qrs_dur': qrs_dur
                     })
             del sig 
         return patients_data
@@ -106,6 +114,11 @@ class DatasetBuilder:
         val_patients = blk_val + n_val
         test_patients = blk_test + n_test
 
+        # Сохраняем разделения для каскада
+        self._save_split(train_patients, 'blk_train.txt')
+        self._save_split(val_patients, 'blk_val.txt')
+        self._save_split(test_patients, 'blk_test.txt')
+
         X_train, y_train, sym_train = self._balance_split(patients_data, train_patients, TARGET_TRAIN, is_train=True)
         X_val, y_val, sym_val = self._balance_split(patients_data, val_patients, TARGET_VAL, is_train=False)
         X_test, y_test, sym_test = self._balance_split(patients_data, test_patients, TARGET_TEST, is_train=False)
@@ -128,13 +141,12 @@ class DatasetBuilder:
         final_data = [blockades[i] for i in sampled_blk_idx] + [normals[i] for i in sampled_norm_idx]
         np.random.shuffle(final_data)
         
-        X = np.zeros((len(final_data), 2, SEGMENT_SAMPLES)) # Обратно 2 канала!
+        X = np.zeros((len(final_data), 2, SEGMENT_SAMPLES))
         y = np.array([d['label'] for d in final_data])
         sym = np.array([d['original_symbol'] for d in final_data])
         
         for i, d in enumerate(final_data): 
             X[i, 0, :] = d['segment'] 
-            # Считаем ширину прямо из того сегмента, который лежит в X[i, 0]
             X[i, 1, :] = Signal(data=d['segment'], fs=360).get_qrs_duration_norm(d['segment']) * 2.0
         
         if is_train:
@@ -143,27 +155,15 @@ class DatasetBuilder:
             if len(X_aug) > 0: X = np.concatenate([X, X_aug]); y = np.concatenate([y, y_aug]); sym = np.concatenate([sym, sym_aug])
         return torch.FloatTensor(X), y, sym
 
-    # НОВЫЙ МЕТОД: Генерация диверсифицированного шума
     def _get_random_noise_segment(self, length):
         noise_types = list(self.noise_data.keys())
         if not noise_types:
             return np.zeros(length)
             
-        # Расширенные стратегии:
-        # 20% - Чистый физиологический (мышцы/электрод)
-        # 10% - Смесь физиологий
-        # 10% - Чистый приборный БГШ
-        # 10% - Смесь Физиология + БГШ
-        # 15% - Сетевая наводка 50 Гц
-        # 15% - Прострел электрода (Pop)
-        # 10% - Модуляция дыханием (возвращаем мультипликативный шум, единицы)
-        # 10% - Клиппинг (возвращаем специальный флаг, обработаем вне)
-        
-        # Для простоты вернем аддитивные шумы, а мультипликативные/нелинейные сделаем отдельным методом
         strategy = np.random.choice([
             'pure', 'mixed_physio', 'awgn', 'mixed_total', 
             'powerline', 'pop'
-        ], p=[0.2, 0.1, 0.1, 0.1, 0.2, 0.3]) # Повышаем шанс на самые опасные: 50Hz и Pop
+        ], p=[0.2, 0.1, 0.1, 0.1, 0.2, 0.3])
             
         if strategy == 'pure' or len(noise_types) == 1:
             n_type = np.random.choice(noise_types)
@@ -194,23 +194,19 @@ class DatasetBuilder:
             return w1 * physio_frag + (1.0 - w1) * awgn_frag
             
         elif strategy == 'powerline':
-            # 50 Гц (или 60 Гц) сетевая наводка
             freq = np.random.choice([50.0, 60.0])
             phase = np.random.uniform(0, 2 * np.pi)
             t = np.arange(length) / TARGET_FS
-            # Генерируем чистую синусоиду (амплитуду подгонит add_noise)
             return np.sin(2 * np.pi * freq * t + phase)
             
         elif strategy == 'pop':
-            # "Прострел" электрода: резкий spike + экспоненциальный спад
             noise = np.zeros(length)
-            pop_idx = np.random.randint(length // 4, 3 * length // 4) # Где-то в середине окна
+            pop_idx = np.random.randint(length // 4, 3 * length // 4)
             amplitude = np.random.choice([-1, 1]) * np.random.uniform(3.0, 10.0)
             decay_rate = np.random.uniform(0.01, 0.05)
             
             noise[pop_idx] = amplitude
             if pop_idx + 1 < length:
-                # Экспоненциальный спад после скачка
                 tail_len = length - pop_idx - 1
                 noise[pop_idx+1:] = amplitude * np.exp(-decay_rate * np.arange(tail_len))
             return noise
@@ -223,23 +219,19 @@ class DatasetBuilder:
             item = base_data[idx]
             temp_sig = Signal(data=item['segment'], fs=TARGET_FS)
             
-            # 1. Искажения морфологии (ДО добавления шума)
-            if np.random.rand() < 0.3: # 30% шанс модуляции дыханием
+            if np.random.rand() < 0.3:
                 temp_sig = temp_sig.respiratory_modulation()
-            if np.random.rand() < 0.1: # 10% шанс клиппинга АЦП
+            if np.random.rand() < 0.1:
                 temp_sig = temp_sig.adc_clipping()
                 
-            # 2. Временной сдвиг
             shifted_sig = temp_sig.time_shift(max_shift_ms=30)
             
-            # 3. Наложение шума
             if self.noise_data:
                 noise_frag = self._get_random_noise_segment(SEGMENT_SAMPLES)
                 augmented_sig = shifted_sig.add_noise(noise_frag, snr_db_range=(-12, 6))
             else:
                 augmented_sig = shifted_sig
             
-            # 4. Вейвлет-фильтрация и нормализация
             denoised_sig = augmented_sig.wavelet_denoise()
             denoised_sig.standardize()
             
@@ -247,12 +239,11 @@ class DatasetBuilder:
             aug_seg = denoised_sig.get_segment(center, 288)
             
             if aug_seg is not None:
-                # ВЫЧИСЛЯЕМ ШИРИНУ ИЗ ЗАШУМЛЕННОГО И ОЧИЩЕННОГО СИГНАЛА!
                 noisy_qrs_dur = denoised_sig.get_qrs_duration_norm(aug_seg)
                 
                 x_item = np.zeros((2, 288))
                 x_item[0, :] = aug_seg       
-                x_item[1, :] = noisy_qrs_dur * 2.0 # Используем зашумленную ширину
+                x_item[1, :] = noisy_qrs_dur * 2.0
                 X_aug.append(x_item); y_aug.append(item['label']); sym_aug.append(item['original_symbol'])
                 
             del temp_sig, shifted_sig, augmented_sig, denoised_sig
@@ -261,11 +252,10 @@ class DatasetBuilder:
         return np.array(X_aug), np.array(y_aug), np.array(sym_aug)
     
     def generate_noisy_test_set(self, X_test, y_test, sym_test):
-        """Создает копию тестовой выборки, но сильно зашумленную"""
         X_noisy = torch.zeros_like(X_test)
         for i in range(X_test.shape[0]):
             segment = X_test[i, 0, :].numpy()
-            qrs_dur = X_test[i, 1, 0].item() # Берем оригинальную длительность
+            qrs_dur = X_test[i, 1, 0].item()
             
             temp_sig = Signal(data=segment, fs=360); shifted_sig = temp_sig.time_shift(max_shift_ms=20)
             if self.noise_data:
@@ -277,7 +267,6 @@ class DatasetBuilder:
             aug_seg = denoised_sig.get_segment(center, 288)
             if aug_seg is not None: 
                 X_noisy[i, 0, :] = torch.FloatTensor(aug_seg)
-                # Вычисляем ширину из зашумленного сегмента
                 noisy_qrs_dur = Signal(data=aug_seg, fs=360).get_qrs_duration_norm(aug_seg)
                 X_noisy[i, 1, :] = noisy_qrs_dur * 2.0
             else: X_noisy[i] = X_test[i]

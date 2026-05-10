@@ -1,21 +1,15 @@
-# app/core/data_loader.py
 import numpy as np
 import os
 
 class DataLoader:
     @staticmethod
     def load_file(file_path):
-        """
-        Универсальный метод загрузки.
-        Возвращает словарь: {'signal': np.array, 'fs': int, 'leads': list, 'annotations': list}
-        """
         ext = os.path.splitext(file_path)[1].lower()
-        
-        if ext in ['.dat', '.hea']: # WFDB format
+        if ext in ['.dat', '.hea']:
             return DataLoader._load_wfdb(file_path)
-        elif ext == '.edf': # EDF format
+        elif ext == '.edf':
             return DataLoader._load_edf(file_path)
-        elif ext == '.csv': # CSV format
+        elif ext == '.csv':
             return DataLoader._load_csv(file_path)
         else:
             raise ValueError(f"Неподдерживаемый формат файла: {ext}")
@@ -23,13 +17,12 @@ class DataLoader:
     @staticmethod
     def _load_wfdb(file_path):
         import wfdb
-        # Убираем расширение для wfdb
-        record_path = file_path.replace('.dat', '').replace('.hea', '')
+        # ИСПРАВЛЕНО: Надежная очистка пути от расширений
+        base_path = os.path.splitext(file_path)[0]
         try:
-            record = wfdb.rdrecord(record_path)
-            # Попытка загрузить аннотации
+            record = wfdb.rdrecord(base_path)
             try:
-                ann = wfdb.rdann(record_path, 'atr')
+                ann = wfdb.rdann(base_path, 'atr')
                 annotations = list(zip(ann.sample, ann.symbol))
             except:
                 annotations = []
@@ -53,12 +46,11 @@ class DataLoader:
             signal = np.zeros((f.getNSamples()[0], n_channels))
             for i in range(n_channels):
                 signal[:, i] = f.readSignal(i)
-            
             return {
                 'signal': signal,
-                'fs': f.getSampleFrequency(0), # Берем частоту первого канала
+                'fs': f.getSampleFrequency(0),
                 'leads': f.getSignalLabels(),
-                'annotations': [], # EDF annotations parsing is more complex
+                'annotations': [],
                 'units': [f.getLabel(i) for i in range(n_channels)]
             }
         except Exception as e:
@@ -66,16 +58,13 @@ class DataLoader:
 
     @staticmethod
     def _load_csv(file_path):
-        # Предполагаем, что первая строка - заголовок, первый столбец - время или просто сэмплы
         try:
             data = np.loadtxt(file_path, delimiter=',', skiprows=1)
-            # Если данные одномерные, превращаем в 2D
             if data.ndim == 1:
                 data = data.reshape(-1, 1)
-            
             return {
                 'signal': data,
-                'fs': 250, # Дефолтное значение для CSV, нужно уточнять у пользователя
+                'fs': 250,
                 'leads': [f'Lead {i+1}' for i in range(data.shape[1])],
                 'annotations': [],
                 'units': ['mV'] * data.shape[1]
