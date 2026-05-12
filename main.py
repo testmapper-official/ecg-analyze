@@ -5,7 +5,7 @@ from app.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Holter Monitor")
+    app.setApplicationName("Алгоритмы классификации QRS-комплексов")
     
     # Принудительно светлый современный стиль
     app.setStyle("Fusion")

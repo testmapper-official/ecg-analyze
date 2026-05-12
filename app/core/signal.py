@@ -178,3 +178,192 @@ class Signal:
         # Норма выдаст ~1.0, Блокада выдаст ~1.5 - 2.0
         norm_duration = duration_samples / 28.8 
         return norm_duration
+    
+    # -----------------------------------------------------------------
+    # 1. Амплитуда R (п.1.1)
+    def get_R_amplitude(self, segment, target_samples=288):
+        center = target_samples // 2
+        return float(np.max(segment[center - 5 : center + 6]))
+
+    # 2. Амплитуда Q (п.1.2)
+    def get_Q_amplitude(self, segment, target_samples=288):
+        center = target_samples // 2
+        return float(np.min(segment[center - 15 : center - 2]))
+
+    # 3. Амплитуда S (п.1.2)
+    def get_S_amplitude(self, segment, target_samples=288):
+        center = target_samples // 2
+        return float(np.min(segment[center + 3 : center + 16]))
+
+    # 4. Отношение R/S
+    def get_R_over_S_ratio(self, segment, epsilon=1e-8):
+        return abs(self.get_R_amplitude(segment)) / (abs(self.get_S_amplitude(segment)) + epsilon)
+
+    # 5. Суммарный размах QRS
+    def get_total_swing(self, segment):
+        return self.get_R_amplitude(segment) - min(self.get_Q_amplitude(segment), self.get_S_amplitude(segment))
+
+    # 6. Отношение Q/R
+    def get_Q_R_ratio(self, segment, epsilon=1e-8):
+        return abs(self.get_Q_amplitude(segment)) / (abs(self.get_R_amplitude(segment)) + epsilon)
+
+    # 7. QRS длительность по 50%
+    def get_QRS_duration_50(self, segment, target_samples=288):
+        center = target_samples // 2
+        R_amp = self.get_R_amplitude(segment, target_samples)
+        if R_amp == 0:
+            return 0.0
+        thr = 0.5 * R_amp
+        onset = center
+        while onset > 0 and segment[onset] > thr:
+            onset -= 1
+        offset = center
+        while offset < target_samples - 1 and segment[offset] > thr:
+            offset += 1
+        return float(offset - onset)
+
+    # 8. Асимметрия QRS
+    def get_asymmetry_ratio(self, segment, target_samples=288, epsilon=1e-8):
+        center = target_samples // 2
+        R_amp = self.get_R_amplitude(segment, target_samples)
+        if R_amp == 0:
+            return 1.0
+        thr = 0.5 * R_amp
+        onset = center
+        while onset > 0 and segment[onset] > thr:
+            onset -= 1
+        offset = center
+        while offset < target_samples - 1 and segment[offset] > thr:
+            offset += 1
+        rise = center - onset
+        fall = offset - center
+        return rise / (fall + epsilon)
+
+    # 9. Макс. подъём
+    def get_max_upstroke(self, segment, target_samples=288):
+        center = target_samples // 2
+        diffs = np.diff(segment[center - 20 : center + 1])
+        return float(np.max(diffs))
+
+    # 10. Макс. спад
+    def get_max_downstroke(self, segment, target_samples=288):
+        center = target_samples // 2
+        diffs = np.diff(segment[center : center + 21])
+        return float(np.min(diffs))
+
+    # 11. Отношение крутизны
+    def get_mean_slope_ratio(self, segment, epsilon=1e-8):
+        up = self.get_max_upstroke(segment)
+        down = self.get_max_downstroke(segment)
+        return abs(up) / (abs(down) + epsilon)
+
+    # 12. Zero-crossings в ядре QRS
+    def get_zero_crossings_qrs(self, segment, target_samples=288):
+        center = target_samples // 2
+        zcr = sum(
+            1 for i in range(center - 15, center + 15)
+            if i + 1 < target_samples and segment[i] * segment[i + 1] < 0
+        )
+        return float(zcr)
+
+    # 13. Энергия QRS / общая энергия
+    def get_energy_ratio(self, segment, target_samples=288):
+        center = target_samples // 2
+        qrs_energy = np.sum(segment[center - 20 : center + 21] ** 2)
+        total_energy = np.sum(segment ** 2)
+        return float(qrs_energy / total_energy) if total_energy != 0 else 0.0
+
+    # 14. Эксцесс QRS
+    def get_kurtosis_qrs(self, segment, target_samples=288):
+        center = target_samples // 2
+        region = segment[center - 20 : center + 21]
+        return float(np.mean(region ** 4))
+
+    # 15. Энтропия QRS (с защитой от вырожденного диапазона)
+    def get_entropy_qrs(self, segment, target_samples=288, bins=12):
+        center = target_samples // 2
+        region = segment[center - 20 : center + 21]
+        # Если размах менее 1e-8, гистограмма не имеет смысла → энтропия 0
+        if np.max(region) - np.min(region) < 1e-8:
+            return 0.0
+        hist, _ = np.histogram(region, bins=bins)
+        prob = hist / np.sum(hist)
+        prob = prob[prob > 0]
+        return float(-np.sum(prob * np.log2(prob)))
+
+    # --- Дополнительные для мультикласса (A, E, B) ---
+    # D2. Энергия P-волны
+    def get_P_energy_ratio(self, segment, target_samples=288, epsilon=1e-8):
+        center = target_samples // 2
+        p_zone = segment[center - 72 : center - 43]
+        noise_zone = segment[-20:]
+        return float(np.mean(np.abs(p_zone)) / (np.mean(np.abs(noise_zone)) + epsilon))
+
+    # D3. Полярность P-волны
+    def get_P_polarity(self, segment, target_samples=288):
+        center = target_samples // 2
+        p_zone = segment[center - 72 : center - 43]
+        max_p = np.max(p_zone)
+        min_p = np.min(p_zone)
+        return float((max_p - min_p) / (abs(max_p) + abs(min_p) + 1e-8))
+
+    # D4. QRSd_ratio (15%/50%)
+    def get_QRSd_ratio_15_50(self, segment, target_samples=288):
+        qrsd_15 = self.get_qrs_duration_norm(segment, target_samples) * 28.8  # отсчёты
+        qrsd_50 = self.get_QRS_duration_50(segment, target_samples)
+        return qrsd_15 / (qrsd_50 + 1e-8)
+
+    # D5. R' (вторичный R)
+    def get_R2_presence(self, segment, target_samples=288):
+        center = target_samples // 2
+        R_amp = self.get_R_amplitude(segment, target_samples)
+        s_idx = center + np.argmin(segment[center : center + 30])
+        if s_idx + 5 < target_samples:
+            r2 = np.max(segment[s_idx + 5 : min(s_idx + 40, target_samples)])
+            return 1.0 if r2 > 0.15 * R_amp else 0.0
+        return 0.0
+
+    # D6. Патологический Q
+    def get_pathologic_Q(self, segment, target_samples=288):
+        Q_amp = self.get_Q_amplitude(segment, target_samples)
+        R_amp = self.get_R_amplitude(segment, target_samples)
+        return 1.0 if abs(Q_amp) > 0.25 * abs(R_amp) else 0.0
+
+    # D7. Смещение ST
+    def get_ST_dev(self, segment, target_samples=288):
+        center = target_samples // 2
+        return float(np.mean(segment[center + 25 : center + 51]))
+
+    # D10. Время активации
+    def get_activation_time(self, segment, target_samples=288):
+        center = target_samples // 2
+        R_amp = self.get_R_amplitude(segment, target_samples)
+        if R_amp == 0:
+            return 0.0
+        thr = 0.15 * R_amp
+        onset = center
+        while onset > 0 and abs(segment[onset]) > thr:
+            onset -= 1
+        return float(center - onset)
+
+    # D11. P/R
+    def get_P_over_R(self, segment, target_samples=288):
+        center = target_samples // 2
+        p_zone = segment[center - 72 : center - 43]
+        P_amp = np.max(np.abs(p_zone))
+        R_amp = abs(self.get_R_amplitude(segment, target_samples))
+        return float(P_amp / (R_amp + 1e-8))
+    
+    # D12. Индикатор расщепления R-пика (Количество смен знака производной)
+    def get_qrs_velocity_changes(self, segment, target_samples=288):
+        """Считает смену знака производной в зоне QRS. 
+        Для нормы: 1-2 смены, для блокады (M-образный): 3+ смены."""
+        center = target_samples // 2
+        start_idx = max(0, center - 30)
+        end_idx = min(target_samples, center + 30)
+        qrs_region = segment[start_idx:end_idx]
+        
+        d1 = np.gradient(qrs_region)
+        sign_changes = np.sum(np.diff(np.sign(d1)) != 0)
+        
+        return float(sign_changes)

@@ -2,7 +2,9 @@ import os
 import numpy as np
 import time
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
-                             QFileDialog, QMessageBox, QProgressBar, QLabel, QPushButton, QProgressDialog, QMenuBar, QAction, QSizeGrip)
+                             QFileDialog, QMessageBox, QProgressBar, QLabel, QPushButton, 
+                             QProgressDialog, QMenuBar, QAction, QSizeGrip,
+                             QDialog, QFormLayout, QComboBox, QDialogButtonBox) # ДОБАВЛЕНЫ ИМПОРТЫ ДЛЯ ДИАЛОГА
 from PyQt5.QtCore import Qt
 
 from app.ui.toolbar import AppToolBar
@@ -23,13 +25,43 @@ DANGER_MAP = {
     'V': 1, 'M': 1, 'P': 1, 'i': 1, 'A': 1, 'F': 1, 'E': 1, 'e': 1   
 }
 
+# ==========================================
+# ДИАЛОГ ВЫБОРА МОДЕЛЕЙ
+# ==========================================
+class ModelSelectionDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Настройка классификатора")
+        self.setFixedSize(300, 150)
+        
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+        
+        self.combo_pss = QComboBox()
+        self.combo_pss.addItems(["TCN", "MLP"])
+        form_layout.addRow("Модель ПЖС:", self.combo_pss)
+        
+        self.combo_blk = QComboBox()
+        self.combo_blk.addItems(["TCN", "MLP"])
+        form_layout.addRow("Модель Блокад:", self.combo_blk)
+        
+        layout.addLayout(form_layout)
+        
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def get_selected_models(self):
+        return self.combo_pss.currentText(), self.combo_blk.currentText()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Holter Monitor")
+        self.setWindowTitle("Алгоритмы классификации QRS-комплексов")
         self.resize(1400, 800)
 
-        # Включаем безрамочное окно для использования кастомного титула
         self.setWindowFlags(Qt.FramelessWindowHint)
         
         self.project_mgr = ProjectManager()
@@ -48,21 +80,18 @@ class MainWindow(QMainWindow):
         self._update_recent_menus()
 
     def init_ui(self):
-        # Центральный виджет и главный вертикальный лейаут
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_v_layout = QVBoxLayout(central_widget)
         main_v_layout.setContentsMargins(0, 0, 0, 0)
-        main_v_layout.setSpacing(0) # Убираем зазоры между титулом, меню и тулбаром
+        main_v_layout.setSpacing(0)
 
-        # 1. Кастомный титулбар (Самый верхний элемент)
         self.custom_title_bar = CustomTitleBar(self)
         main_v_layout.addWidget(self.custom_title_bar)
 
-        # 2. Менюбар (Файл и т.д.)
         self.menubar = QMenuBar(self)
-        self.menubar.setNativeMenuBar(False) # Принудительно отрисовываем внутри окна
-        self.menubar.setMaximumHeight(25)    # Фиксируем высоту, чтобы не прыгал стиль
+        self.menubar.setNativeMenuBar(False)
+        self.menubar.setMaximumHeight(25)
         file_menu = self.menubar.addMenu("Файл")
         self.act_open_file = QAction("Открыть файл сигнала", self)
         self.act_open_project = QAction("Открыть проект", self)
@@ -75,17 +104,14 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.act_exit)
         main_v_layout.addWidget(self.menubar)
 
-        # 3. Тулбар с кнопками
         self.toolbar = AppToolBar()
         self.toolbar.setMovable(False)
-        # Убираем стандартную обводку тулбара, чтобы он выглядел как часть интерфейса, а не плавающее окно
         self.toolbar.setStyleSheet("QToolBar { border: none; spacing: 5px; padding: 2px; }")
         main_v_layout.addWidget(self.toolbar)
 
-        # 4. Основной контент (ЭКГ, панели)
         content_widget = QWidget()
         content_layout = QHBoxLayout(content_widget)
-        content_layout.setContentsMargins(5, 5, 5, 5) # Небольшие отступы для красоты
+        content_layout.setContentsMargins(5, 5, 5, 5)
 
         right_layout = QVBoxLayout()
         self.ecg_viewer = ECGViewer()
@@ -115,14 +141,12 @@ class MainWindow(QMainWindow):
 
         main_v_layout.addWidget(content_widget, stretch=1)
 
-        # 5. Статусбар (остается стандартным, внизу)
         self.status_label = QLabel("Готово")
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.statusBar().addPermanentWidget(self.progress_bar, 1)
         self.statusBar().addPermanentWidget(self.status_label, 1)
         
-        # Добавляем Grip для изменения размера окна в правом нижнем углу, т.к. рамок нет
         self.size_grip = QSizeGrip(self)
         self.statusBar().addPermanentWidget(self.size_grip, 0)
 
@@ -193,8 +217,7 @@ class MainWindow(QMainWindow):
             self.orig_fs = data['fs']
             self.toolbar.set_leads(data['leads'])
             
-            # Обновляем текст в кастомном титулбаре
-            title_text = f"Holter Monitor - Запись: {self.project_mgr.record_name} | Частота: {self.orig_fs} Гц"
+            title_text = f"Алгоритмы классификации QRS-комплексов - Запись: {self.project_mgr.record_name} | Частота: {self.orig_fs} Гц"
             self.custom_title_bar.title.setText(title_text)
 
             ratio = 360.0 / self.orig_fs
@@ -359,8 +382,19 @@ class MainWindow(QMainWindow):
         self._rebuild_merged_annotations()
         self.status_label.setText("Детекция R-пиков завершена")
 
+    # ==========================================
+    # ИЗМЕНЕННАЯ ЛОГИКА ЗАПУСКА АНАЛИЗА
+    # ==========================================
     def start_analysis(self):
         if self.current_signal_data is None: return
+        
+        # 1. Вызываем диалог выбора моделей
+        dialog = ModelSelectionDialog(self)
+        if dialog.exec_() != ModelSelectionDialog.Accepted:
+            return # Пользователь нажал Отмена
+            
+        pss_model_type, blk_model_type = dialog.get_selected_models()
+        
         self.progress_bar.setVisible(True)
         models_dir = 'models' 
         if not os.path.exists(os.path.join(models_dir, 'TCN_BLK.pth')): 
@@ -368,7 +402,16 @@ class MainWindow(QMainWindow):
             return
             
         existing_r_peaks = [ann['sample'] for ann in self.merged_annotations_360 if not ann.get('is_rhythm')]
-        self.ann_worker = AnalysisWorker(self.current_signal_data[:, self.current_lead_idx], self.orig_fs, models_dir, existing_r_peaks=existing_r_peaks)
+        
+        # 2. Передаем выбранные типы моделей в Worker
+        self.ann_worker = AnalysisWorker(
+            self.current_signal_data[:, self.current_lead_idx], 
+            self.orig_fs, 
+            models_dir, 
+            existing_r_peaks=existing_r_peaks,
+            pss_model_type=pss_model_type,
+            blk_model_type=blk_model_type
+        )
         self.ann_worker.progress_step.connect(self.status_label.setText)
         self.ann_worker.progress_percent.connect(self.progress_bar.setValue)
         self.ann_worker.finished.connect(self.on_analysis_finished)

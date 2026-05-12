@@ -2,8 +2,9 @@ import os
 import numpy as np
 import torch
 import wfdb
-from collections import Counter, defaultdict
-from sklearn.metrics import confusion_matrix, classification_report
+from collections import defaultdict
+from sklearn.metrics import (confusion_matrix, classification_report, roc_curve, auc, 
+                             precision_score, recall_score, f1_score, accuracy_score)
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -12,264 +13,326 @@ import seaborn as sns
 from app.core.signal import Signal
 from app.core.holter_classifier import HolterClassifier
 
-# Маппинг оригинальных символов БД в наши макро-классы
+# --- НАСТРОЙКИ И МАППИНГИ ---
+DB_ROOT = 'DB'
+MYDB_PATH = os.path.join(DB_ROOT, 'mydb')
+RESULTS_ROOT = 'results/final'
+CASCADE_DIR = os.path.join(RESULTS_ROOT, 'Cascade')
+
+VAL_CLASSES = ['N', 'A', 'B', 'E', 'V']
+TARGET_VAL_COUNT = 750
+
 DB_SYMBOL_TO_CLASS = {
     'N': 'N', 'e': 'N', 'j': 'N',
     'A': 'A', 'a': 'A', 'J': 'A', 'S': 'A',
     'L': 'B', 'R': 'B',
     'E': 'E',
-    'r': 'r', # R-on-T не входит в базовые 5 классов для баланса
-    'V': 'V', 'F': 'V' 
+    'r': 'V', 'V': 'V', 'F': 'V' 
 }
 
-# Маппинг выходных меток классификатора в макро-классы (схлопываем подтипы ПЖС в V)
 PRED_TO_CLASS = {
     'N': 'N', 'A': 'A', 'B': 'B', 'E': 'E', 'r': 'V',
     'i': 'V', 'M': 'V', 'P': 'V'  
 }
 
-# 5 макро-классов для валидации
-VAL_CLASSES = ['N', 'A', 'B', 'E', 'V']
-TARGET_VAL_COUNT = 750
+VALID_QRS_SYMBOLS = ['V', 'F', 'r', 'i', 'M', 'P', 'B', 'L', 'R', 'A', 'a', 'N', 'E', 'e']
 
-def load_test_patients(db_root):
-    """Загружает ID пациентов из тестовых выборок BLK и PSS"""
-    splits_dir = os.path.join(db_root, 'splits')
-    blk_test_patients = set()
-    pss_test_patients = set()
-    
-    blk_test_path = os.path.join(splits_dir, 'blk_test.txt')
-    pss_test_path = os.path.join(splits_dir, 'pss_test.txt')
-    
-    if os.path.exists(blk_test_path):
-        with open(blk_test_path, 'r') as f:
-            for line in f:
-                pid = line.strip()
-                if pid: blk_test_patients.add(pid)
-    else:
-        print(f"ПРЕДУПРЕЖДЕНИЕ: Файл {blk_test_path} не найден. Сначала обучите BLK модель.")
-        
-    if os.path.exists(pss_test_path):
-        with open(pss_test_path, 'r') as f:
-            for line in f:
-                pid = line.strip()
-                if pid: pss_test_patients.add(pid)
-    else:
-        print(f"ПРЕДУПРЕЖДЕНИЕ: Файл {pss_test_path} не найден. Сначала обучите PSS модель.")
-        
-    return blk_test_patients, pss_test_patients
+# --- ФУНКЦИИ ГЕНЕРАЦИИ ШУМА ---
+def generate_worst_case_noise(length, fs=360):
+    t = np.arange(length) / fs
+    awgn = np.random.normal(0, 0.5, length)
+    drift = 0.5 * np.sin(2 * np.pi * np.random.uniform(0.2, 0.5) * t + np.random.uniform(0, 2*np.pi))
+    emg = 0.2 * np.random.normal(0, 1, length) * np.sin(2 * np.pi * np.random.uniform(20, 50) * t)
+    return awgn + drift + emg
 
-def load_noise_data(db_root):
-    """Загружает физиологический шум из NSTDB для зашумления тестовой выборки"""
-    nstdb_path = os.path.join(db_root, 'nstdb')
-    noises = {}
-    for n_type in ['em', 'ma']:
-        try:
-            rec = wfdb.rdrecord(os.path.join(nstdb_path, n_type))
-            if rec.fs != 360:
-                 noises[n_type] = Signal(data=rec.p_signal[:, 0], fs=rec.fs).resampled_data
-            else:
-                 noises[n_type] = rec.p_signal[:, 0]
-        except Exception as e:
-            print(f"ОШИБКА ЗАГРУЗКИ ШУМА {n_type}: {e}")
-    return noises
-
-def add_noise_to_signal(sig_obj, noise_data, snr_db_range=(-3, 12)):
-    """Накладывает шум на весь сигнал целиком, затем фильтрует и нормализует"""
-    if not noise_data or len(sig_obj.resampled_data) == 0:
-        return sig_obj
-        
-    # Выбираем случайный тип шума (em или ma)
-    n_type = np.random.choice(list(noise_data.keys()))
-    noise_base = noise_data[n_type]
-    
-    # Метод add_noise внутри класса Signal сам заботится о нарезке/зацикливании шума
-    noisy_sig = sig_obj.add_noise(noise_base, snr_db_range=snr_db_range)
-    noisy_sig = noisy_sig.wavelet_denoise()
-    noisy_sig.standardize()
-    
+def add_noise_to_signal(sig_obj):
+    noisy_data = sig_obj.resampled_data + generate_worst_case_noise(len(sig_obj.resampled_data), 360)
+    noisy_sig = Signal(data=noisy_data, fs=360, annotations=sig_obj.annotations)
     return noisy_sig
 
-def calculate_rhythm_confidence(sig_obj, start_sample, end_sample, rhythm_type):
-    """Считает % истинных меток в эпизоде, подтверждающих ритм"""
-    true_in_span = [ann['symbol'] for ann in sig_obj.annotations 
-                    if start_sample <= ann['sample'] <= end_sample]
-    if not true_in_span: return 0.0
-    
-    if rhythm_type in ['(V', '(B', '(T']: 
-        matches = sum(1 for s in true_in_span if s in ['V', 'F', 'r', 'E'])
-    elif rhythm_type == '(BLK': 
-        matches = sum(1 for s in true_in_span if s in ['L', 'R'])
-    else: matches = 0
-    return (matches / len(true_in_span)) * 100.0
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ МЕТРИК ---
+def calculate_specificity(y_true, y_pred, labels):
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    spec_per_class = []
+    for i in range(len(labels)):
+        tn = cm.sum() - (cm[i, :].sum() + cm[:, i].sum() - cm[i, i])
+        fp = cm[:, i].sum() - cm[i, i]
+        spec_per_class.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
+    return np.mean(spec_per_class)
 
-def evaluate_cascade_validation(classifier, records, db_root, results_dir, blk_test_patients, pss_test_patients, noise_data):
-    """Сбор 750 примеров на класс (чистые + зашумленные) и оценка каскада"""
-    md_path = os.path.join(results_dir, "validation_and_rhythms.md")
+def save_metrics_and_plots(y_true, y_pred, class_name, output_dir, prefix=""):
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Счетчики для валидации (одни на двоих, так как набор истинных классов один)
+    if len(y_true) == 0:
+        print(f"WARNING: No data for {class_name} ({prefix}). Skipping metrics.")
+        return {'Precision': 0, 'Recall': 0, 'F1': 0, 'Accuracy': 0, 'Specificity': 0, 'AUC': 0}
+
+    # 1. Метрики
+    prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    rec = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+    spec = calculate_specificity(y_true, y_pred, labels=np.unique(y_true + y_pred).tolist())
+    
+    # AUC-ROC (Псевдо-вероятности для мультикласса, так как каскад выдает жесткие метки)
+    from sklearn.preprocessing import LabelBinarizer
+    lb = LabelBinarizer()
+    y_true_bin = lb.fit_transform(y_true)
+    y_pred_bin = lb.transform(y_pred)
+    y_prob = np.where(y_pred_bin == 1, 0.9, 0.1)
+    
+    roc_auc = 0.0
+    if len(np.unique(y_true)) >= 2:
+        fpr, tpr, _ = roc_curve(y_true_bin.ravel(), y_prob.ravel())
+        roc_auc = auc(fpr, tpr)
+        plt.figure()
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')
+        plt.title(f'AUC-ROC - {class_name} ({prefix})')
+        plt.legend(loc="lower right")
+        plt.savefig(os.path.join(output_dir, f'{prefix}_auc_roc.png'), dpi=150)
+        plt.close()
+
+    # Столбчатая диаграмма метрик
+    metrics = {'Precision': prec, 'Recall': rec, 'F1': f1, 'Accuracy': acc, 'Specificity': spec, 'AUC': roc_auc}
+    plt.figure()
+    bars = plt.bar(metrics.keys(), metrics.values(), color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b'])
+    plt.ylim(0, 1.05)
+    plt.title(f'Metrics - {class_name} ({prefix})')
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.01, f'{yval:.3f}', ha='center', va='bottom')
+    plt.savefig(os.path.join(output_dir, f'{prefix}_metrics_bar.png'), dpi=150)
+    plt.close()
+
+    # Матрица ошибок 5x5
+    cm = confusion_matrix(y_true, y_pred, labels=VAL_CLASSES)
+    plt.figure(figsize=(8,6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=VAL_CLASSES, yticklabels=VAL_CLASSES)
+    plt.title(f'Confusion Matrix - {class_name} ({prefix})')
+    plt.ylabel('True'); plt.xlabel('Predicted')
+    plt.savefig(os.path.join(output_dir, f'{prefix}_confusion_matrix.png'), dpi=150)
+    plt.close()
+
+    return metrics
+
+# --- ОЦЕНКА КАСКАДА ---
+def evaluate_cascade(classifier, records):
+    print("\n=== Оценка каскадного классификатора ===")
     val_counts = {cls: 0 for cls in VAL_CLASSES}
     
-    # Раздельные хранилища для предсказаний
-    y_true_clean, y_pred_clean = [], []
-    y_pred_noisy = []
+    y_true_bal_c, y_pred_bal_c = [], []
+    y_true_bal_n, y_pred_bal_n = [], []
+    y_true_full_c, y_pred_full_c = [], []
+    y_true_full_n, y_pred_full_n = [], []
     
-    # Хранилище для ритмов
-    rhythms_data = defaultdict(list)
-    
-    print(f"\n=== ВАЛИДАЦИЯ КАСКАДА (Цель: {TARGET_VAL_COUNT} на класс) + ЗАШУМЛЕНИЕ ===")
-    
-    with open(md_path, 'w', encoding='utf-8') as md_file:
-        md_file.write("# Валидация каскадного классификатора и Отчет по ритмам\n\n")
-        md_file.write("## 1. Сбор валидационной выборки\n\n")
-        md_file.write(f"Цель: {TARGET_VAL_COUNT} экземпляров для классов {', '.join(VAL_CLASSES)}\n\n")
-        
-        for rec_path in records:
-            full_path = os.path.join(db_root, rec_path)
-            if not os.path.exists(full_path + '.atr'): continue
+    for rec_path in records:
+        full_path = os.path.join(MYDB_PATH, rec_path)
+        if not os.path.exists(full_path + '.atr'): continue
+        try:
+            sig_clean = Signal(record_path=full_path)
+            sig_noisy = add_noise_to_signal(sig_clean)
             
-            # Проверяем, не набрали ли мы уже все 5 классов
-            if all(count >= TARGET_VAL_COUNT for count in val_counts.values()):
-                break
+            results_clean, _ = classifier.analyze_signal(sig_clean)
+            results_noisy, _ = classifier.analyze_signal(sig_noisy)
             
-            # Определяем ID пациента для текущей записи
-            parts = rec_path.split('/')
-            patient_id = parts[1] if len(parts) > 1 else None
+            pred_map_clean = {r['sample']: r['label'] for r in results_clean}
+            pred_map_noisy = {r['sample']: r['label'] for r in results_noisy}
+            
+            for ann in sig_clean.annotations:
+                true_sym = ann['symbol'].upper()
+                true_cls = DB_SYMBOL_TO_CLASS.get(true_sym)
+                if true_cls not in VAL_CLASSES: continue
+                peak = ann['sample']
                 
-            print(f"  Обработка: {rec_path}")
-            try:
-                sig = Signal(record_path=full_path)
-                sig.standardize()
+                # FULL
+                pred_c_full = PRED_TO_CLASS.get(pred_map_clean.get(peak, 'N'), 'N')
+                pred_n_full = PRED_TO_CLASS.get(pred_map_noisy.get(peak, 'N'), 'N')
+                y_true_full_c.append(true_cls); y_pred_full_c.append(pred_c_full)
+                y_true_full_n.append(true_cls); y_pred_full_n.append(pred_n_full)
                 
-                # 1. Получаем предсказания для чистого сигнала
-                results_clean, rhythms = classifier.analyze_signal(sig)
-                
-                # 2. Создаем зашумленный сигнал и получаем предсказания для него
-                if noise_data:
-                    noisy_sig = add_noise_to_signal(sig, noise_data, snr_db_range=(-3, 12))
-                    results_noisy, _ = classifier.analyze_signal(noisy_sig)
-                else:
-                    results_noisy = results_clean # Если шума нет, предсказания одинаковы
-                
-                # 3. Собираем ритмы в Markdown (только по чистому сигналу)
-                for rhy in rhythms:
-                    start_sec = rhy['start_sample'] / 360.0
-                    end_sec = rhy['end_sample'] / 360.0
-                    conf = calculate_rhythm_confidence(sig, rhy['start_sample'], rhy['end_sample'], rhy['rhythm'])
-                    rhythms_data[rhy['rhythm']].append({
-                        'record': rec_path, 'start': start_sec, 'end': end_sec, 'conf': conf
-                    })
-                
-                # 4. Собираем валидационную выборку
-                pred_map_clean = {r['sample']: r['label'] for r in results_clean}
-                pred_map_noisy = {r['sample']: r['label'] for r in results_noisy}
-                
-                for ann in sig.annotations:
-                    true_sym = ann['symbol'].upper()
-                    true_cls = DB_SYMBOL_TO_CLASS.get(true_sym)
-                    
-                    # Если класс не входит в наши 5 валидационных, пропускаем
-                    if true_cls not in VAL_CLASSES: continue
-                    # Если уже набрали 750 для этого класса, пропускаем
-                    if val_counts[true_cls] >= TARGET_VAL_COUNT: continue
-                    
-                    # ПРАВИЛА ФИЛЬТРАЦИИ ПОЛЬЗОВАТЕЛЯ:
-                    if true_cls == 'B' and patient_id not in blk_test_patients:
-                        continue
-                    if true_cls == 'V' and patient_id not in pss_test_patients:
-                        continue
-                    
-                    peak = ann['sample']
-                    
-                    # Чистые предсказания
-                    pred_sym_clean = pred_map_clean.get(peak, 'N')
-                    pred_cls_clean = PRED_TO_CLASS.get(pred_sym_clean, 'N')
-                    
-                    # Зашумленные предсказания
-                    pred_sym_noisy = pred_map_noisy.get(peak, 'N')
-                    pred_cls_noisy = PRED_TO_CLASS.get(pred_sym_noisy, 'N')
-                    
-                    # Сохраняем результаты (истинный класс один и тот же)
-                    y_true_clean.append(true_cls)
-                    y_pred_clean.append(pred_cls_clean)
-                    y_pred_noisy.append(pred_cls_noisy)
-                    
+                # BALANCED (750 / класс)
+                if val_counts[true_cls] < TARGET_VAL_COUNT:
                     val_counts[true_cls] += 1
+                    y_true_bal_c.append(true_cls); y_pred_bal_c.append(pred_c_full)
+                    y_true_bal_n.append(true_cls); y_pred_bal_n.append(pred_n_full)
                     
-            except Exception as e: 
-                print(f"Ошибка при обработке {rec_path}: {e}")
+        except Exception as e:
+            print(f"Ошибка {rec_path}: {e}")
+
+    res_bal_clean = save_metrics_and_plots(y_true_bal_c, y_pred_bal_c, "Cascade_Balanced", CASCADE_DIR, prefix="Clean")
+    res_bal_noisy = save_metrics_and_plots(y_true_bal_n, y_pred_bal_n, "Cascade_Balanced", CASCADE_DIR, prefix="Noisy")
+    res_full_clean = save_metrics_and_plots(y_true_full_c, y_pred_full_c, "Cascade_Full", CASCADE_DIR, prefix="Clean")
+    res_full_noisy = save_metrics_and_plots(y_true_full_n, y_pred_full_n, "Cascade_Full", CASCADE_DIR, prefix="Noisy")
+
+    return res_bal_clean, res_bal_noisy, res_full_clean, res_full_noisy
+
+# --- ОЦЕНКА РИТМОВ ---
+def evaluate_rhythms(classifier, records):
+    print("\n=== Оценка ритмов ===")
+    rhythm_stats = {'Clean': defaultdict(list), 'Noisy': defaultdict(list)}
+    
+    for rec_path in records:
+        full_path = os.path.join(MYDB_PATH, rec_path)
+        if not os.path.exists(full_path + '.atr'): continue
+        try:
+            sig_clean = Signal(record_path=full_path)
+            sig_noisy = add_noise_to_signal(sig_clean)
             
-        # Запись прогресса сбора в Markdown
-        for cls in VAL_CLASSES:
-            md_file.write(f"- **{cls}**: собрано {val_counts[cls]} / {TARGET_VAL_COUNT}\n")
-        md_file.write("\n")
+            true_seq = [{'sample': ann['sample'], 'group': HolterClassifier._map_group(ann['symbol'].upper())} 
+                        for ann in sig_clean.annotations if ann['symbol'].upper() in VALID_QRS_SYMBOLS]
+            true_rhythms = HolterClassifier.detect_rhythms(true_seq)
+            
+            _, pred_rhythms_clean = classifier.analyze_signal(sig_clean)
+            _, pred_rhythms_noisy = classifier.analyze_signal(sig_noisy)
+            
+            pred_rhy_clean_fmt = [{'start_sample': r['start_sample'], 'end_sample': r['end_sample'], 'type': r['rhythm'].strip('(')} for r in pred_rhythms_clean]
+            pred_rhy_noisy_fmt = [{'start_sample': r['start_sample'], 'end_sample': r['end_sample'], 'type': r['rhythm'].strip('(')} for r in pred_rhythms_noisy]
+            
+            def merge_rhythms(rhythms):
+                if not rhythms: return []
+                merged = [rhythms[0]]
+                for r in rhythms[1:]:
+                    if r['type'] == merged[-1]['type'] and (r['start_sample'] - merged[-1]['end_sample']) / 360.0 <= 2.0:
+                        merged[-1]['end_sample'] = r['end_sample']
+                    else:
+                        merged.append(r)
+                return merged
 
-        # Запись ритмов в Markdown
-        md_file.write("## 2. Детекция ритмов\n\n")
-        for rhythm_type, episodes in rhythms_data.items():
-            md_file.write(f"### Ритм: {rhythm_type}\n\n")
-            md_file.write("| Запись | Начало (с) | Конец (с) | Достоверность (%) |\n")
-            md_file.write("|---|---|---|---|\n")
-            for ep in episodes:
-                md_file.write(f"| {ep['record']} | {ep['start']:.2f} | {ep['end']:.2f} | {ep['conf']:.1f} |\n")
-            md_file.write("\n")
+            true_rhythms = merge_rhythms(true_rhythms)
+            pred_rhy_clean_fmt = merge_rhythms(pred_rhy_clean_fmt)
+            pred_rhy_noisy_fmt = merge_rhythms(pred_rhy_noisy_fmt)
+            
+            def process_rhythms(pred_rhy, true_rhy, stats_dict):
+                matched_true = set()
+                for pred in pred_rhy:
+                    best_match = None
+                    best_iou = 0
+                    for i, true in enumerate(true_rhy):
+                        if true['type'] == pred['type'] and i not in matched_true:
+                            inter_start = max(pred['start_sample'], true['start_sample'])
+                            inter_end = min(pred['end_sample'], true['end_sample'])
+                            if inter_start < inter_end:
+                                union_start = min(pred['start_sample'], true['start_sample'])
+                                union_end = max(pred['end_sample'], true['end_sample'])
+                                iou = (inter_end - inter_start) / (union_end - union_start)
+                                if iou > best_iou:
+                                    best_iou = iou
+                                    best_match = (i, true)
+                    
+                    if best_match:
+                        matched_true.add(best_match[0])
+                        true = best_match[1]
+                        beats_in_pred = [ann for ann in sig_clean.annotations 
+                                        if pred['start_sample'] <= ann['sample'] <= pred['end_sample']]
+                        correct_beats = sum(1 for b in beats_in_pred if HolterClassifier._map_group(b['symbol'].upper()) == HolterClassifier._map_group(pred['type'][0]))
+                        total_beats = len(beats_in_pred)
+                        overlap_pct = (correct_beats / total_beats * 100) if total_beats > 0 else 0
+                        
+                        start_diff = (pred['start_sample'] - true['start_sample']) / 360.0
+                        end_diff = (pred['end_sample'] - true['end_sample']) / 360.0
+                        
+                        if overlap_pct >= 50:
+                            stats_dict['Partial_Over50'].append(pred['type'])
+                            stats_dict['Start_Diff'].append(start_diff)
+                            stats_dict['End_Diff'].append(end_diff)
+                        if overlap_pct == 100:
+                            stats_dict['Perfect_100'].append(pred['type'])
+                    else:
+                        stats_dict['False_Under50'].append(pred['type'])
+                        
+            process_rhythms(pred_rhy_clean_fmt, true_rhythms, rhythm_stats['Clean'])
+            process_rhythms(pred_rhy_noisy_fmt, true_rhythms, rhythm_stats['Noisy'])
+            
+        except Exception as e:
+            print(f"Ошибка ритмов {rec_path}: {e}")
 
-    # 5. Вычисление метрик и построение матриц ошибок
-    print("\nРасчет метрик для ЧИСТЫХ данных...")
-    print(classification_report(y_true_clean, y_pred_clean, labels=VAL_CLASSES, zero_division=0))
+    os.makedirs(CASCADE_DIR, exist_ok=True)
+    with open(os.path.join(CASCADE_DIR, 'rhythm_report.txt'), 'w', encoding='utf-8') as f:
+        for noise_type in ['Clean', 'Noisy']:
+            f.write(f"=== {noise_type} ===\n")
+            stats = rhythm_stats[noise_type]
+            f.write(f"Ложные (<50% совпадения): {len(stats['False_Under50'])}\n")
+            f.write(f"Частично верные (>50% совпадения): {len(stats['Partial_Over50'])}\n")
+            f.write(f"Идеально верные (100% совпадения): {len(stats['Perfect_100'])}\n")
+            
+            if stats['Start_Diff']:
+                sd_start = np.std(stats['Start_Diff'])
+                sd_end = np.std(stats['End_Diff'])
+                f.write(f"Стандартное отклонение начала (сек): {sd_start:.4f}\n")
+                f.write(f"Стандартное отклонение конца (сек): {sd_end:.4f}\n")
+            else:
+                f.write("Нет данных для расчета SD\n")
+            f.write("\n")
+
+    for noise_type in ['Clean', 'Noisy']:
+        stats = rhythm_stats[noise_type]
+        categories = ['False (<50%)', 'Partial (>50%)', 'Perfect (100%)']
+        counts = [len(stats['False_Under50']), len(stats['Partial_Over50']), len(stats['Perfect_100'])]
+        plt.figure()
+        plt.bar(categories, counts, color=['#d62728', '#ff7f0e', '#2ca02c'])
+        plt.title(f'Rhythm Detection Quality - {noise_type}')
+        plt.ylabel('Count')
+        for i, v in enumerate(counts): plt.text(i, v + 0.1, str(v), ha='center')
+        plt.savefig(os.path.join(CASCADE_DIR, f'rhythm_quality_{noise_type}.png'), dpi=150)
+        plt.close()
+
+# --- СРАВНИТЕЛЬНЫЙ ГРАФИК (Чистый vs Зашумленный) ---
+def plot_comparison(res_clean, res_noisy, class_name, output_dir):
+    print("\n=== Построение сравнительных графиков Clean vs Noisy ===")
+    metrics_to_plot = ['F1', 'Precision', 'Recall', 'Accuracy', 'Specificity', 'AUC']
     
-    cm_clean = confusion_matrix(y_true_clean, y_pred_clean, labels=VAL_CLASSES)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm_clean, annot=True, fmt='d', cmap='Blues', xticklabels=VAL_CLASSES, yticklabels=VAL_CLASSES)
-    plt.title(f"Clean Validation Cascade ({TARGET_VAL_COUNT}/cls)")
-    plt.ylabel('True Label'); plt.xlabel('Predicted Label')
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "validation_cascade_cm_clean.png"), dpi=150); plt.close()
-
-    print("\nРасчет метрик для ЗАШУМЛЕННЫХ данных...")
-    print(classification_report(y_true_clean, y_pred_noisy, labels=VAL_CLASSES, zero_division=0))
+    x = np.arange(len(metrics_to_plot))
+    width = 0.35
     
-    cm_noisy = confusion_matrix(y_true_clean, y_pred_noisy, labels=VAL_CLASSES)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm_noisy, annot=True, fmt='d', cmap='Reds', xticklabels=VAL_CLASSES, yticklabels=VAL_CLASSES)
-    plt.title(f"Noisy Validation Cascade ({TARGET_VAL_COUNT}/cls)")
-    plt.ylabel('True Label'); plt.xlabel('Predicted Label')
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, "validation_cascade_cm_noisy.png"), dpi=150); plt.close()
-
-def evaluate_pipeline(db_root='DB', results_dir='results/Cascade'):
-    os.makedirs(results_dir, exist_ok=True)
+    clean_vals = [res_clean[m] for m in metrics_to_plot]
+    noisy_vals = [res_noisy[m] for m in metrics_to_plot]
     
-    print("Загрузка каскадного классификатора...")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    rects1 = ax.bar(x - width/2, clean_vals, width, label='Clean', color='#1f77b4')
+    rects2 = ax.bar(x + width/2, noisy_vals, width, label='Noisy', color='#ff7f0e')
+    
+    ax.set_ylabel('Score')
+    ax.set_title(f'{class_name} Performance: Clean vs Noisy')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics_to_plot)
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+    
+    for rect in rects1 + rects2:
+        height = rect.get_height()
+        ax.annotate(f'{height:.2f}', xy=(rect.get_x() + rect.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+                    
+    plt.savefig(os.path.join(output_dir, f'{class_name}_clean_vs_noisy.png'), dpi=150)
+    plt.close()
+
+# --- ГЛАВНЫЙ ЗАПУСК ---
+def main():
+    records_file = os.path.join(MYDB_PATH, 'RECORDS')
+    if not os.path.exists(records_file):
+        print(f"Файл RECORDS не найден в {MYDB_PATH}"); return
+        
+    with open(records_file, 'r') as f:
+        records = [line.strip() for line in f if line.strip().startswith('II/')]
+        
+    print(f"Загружено записей из mydb: {len(records)}")
+    
     classifier = HolterClassifier(models_dir='models')
     
-    mydb_path = os.path.join(db_root, 'mydb')
-    records_file = os.path.join(mydb_path, 'RECORDS')
+    # 1. Оценка каскада
+    res_bal_c, res_bal_n, res_full_c, res_full_n = evaluate_cascade(classifier, records)
     
-    if os.path.exists(records_file):
-        blk_test_patients, pss_test_patients = load_test_patients(db_root)
-        print(f"Тестовых пациентов BLK: {len(blk_test_patients)} | PSS: {len(pss_test_patients)}")
-        
-        # Загружаем данные шума
-        noise_data = load_noise_data(db_root)
-        
-        allowed_patients = blk_test_patients.union(pss_test_patients)
-        
-        with open(records_file, 'r') as f:
-            all_records = [line.strip() for line in f if line.strip() and line.strip().startswith('II/')]
-        
-        independent_records = []
-        for rec in all_records:
-            parts = rec.split('/')
-            if len(parts) > 1:
-                patient_id = parts[1]
-                if patient_id in allowed_patients:
-                    independent_records.append(rec)
-        
-        print(f"Всего записей в БД: {len(all_records)}. Записей для независимого теста каскада: {len(independent_records)}")
-        evaluate_cascade_validation(classifier, independent_records, mydb_path, results_dir, blk_test_patients, pss_test_patients, noise_data)
+    # 2. Сравнение Clean vs Noisy
+    plot_comparison(res_bal_c, res_bal_n, "Cascade_Balanced", CASCADE_DIR)
+    plot_comparison(res_full_c, res_full_n, "Cascade_Full", CASCADE_DIR)
     
-    print("\nВсе оценки завершены!")
+    # 3. Оценка ритмов
+    evaluate_rhythms(classifier, records)
+    
+    print("\n=== ВСЕ ОЦЕНКИ ЗАВЕРШЕНЫ ===")
 
 if __name__ == "__main__":
-    evaluate_pipeline()
+    main()

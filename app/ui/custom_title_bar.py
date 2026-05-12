@@ -10,7 +10,7 @@ class CustomTitleBar(QWidget):
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(10, 0, 10, 0)
         
-        self.title = QLabel("Holter Monitor")
+        self.title = QLabel("Алгоритмы классификации QRS-комплексов")
         self.title.setAlignment(Qt.AlignCenter)
         self.title.setFont(QFont("Segoe UI", 10, QFont.Bold))
         

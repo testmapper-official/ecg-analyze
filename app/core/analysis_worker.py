@@ -8,41 +8,45 @@ class AnalysisWorker(QThread):
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
 
-    def __init__(self, signal_data, fs, models_dir='models', existing_r_peaks=None):
+    def __init__(self, signal_data, fs, models_dir='models', existing_r_peaks=None, pss_model_type='TCN', blk_model_type='TCN'):
         super().__init__()
         self.signal_data = signal_data
         self.fs = fs
         self.models_dir = models_dir
         self.existing_r_peaks = existing_r_peaks
+        self.pss_model_type = pss_model_type
+        self.blk_model_type = blk_model_type
 
     def run(self):
         try:
             self.progress_step.emit("Инициализация сигнала...")
             self.progress_percent.emit(20)
             
-            # Signal сам делает ВСЮ обработку (ресэмплирование до 360 Гц внутри конструктора)
             sig = Signal(data=self.signal_data, fs=self.fs)
             
             if self.existing_r_peaks is not None and len(self.existing_r_peaks) > 0:
                 self.progress_step.emit("Использование существующих R-пиков...")
-                # existing_r_peaks из интерфейса уже в координатах 360 Гц, идеально ложатся на resampled_data
                 sig.annotations = [{'sample': int(p), 'symbol': 'N'} for p in self.existing_r_peaks]
             
-            self.progress_step.emit("Запуск каскадного классификатора...")
+            self.progress_step.emit(f"Запуск классификатора (ПЖС: {self.pss_model_type}, БЛК: {self.blk_model_type})...")
             self.progress_percent.emit(50)
             
-            classifier = HolterClassifier(models_dir=self.models_dir)
+            # Передаем выбранные модели в HolterClassifier
+            classifier = HolterClassifier(
+                models_dir=self.models_dir, 
+                pss_model_type=self.pss_model_type, 
+                blk_model_type=self.blk_model_type
+            )
             
-            # Те самые две строчки из скрипта оценки
-            results_clean, rhythms = classifier.analyze_signal(sig)
+            # Анализ сигнала (классификатор внутри сам вызывает движок ритмов,
+            # но из results_clean мы берем только одиночные комплексы, 
+            # т.к. в UI ритмы пересчитываются динамически в _rebuild_merged_annotations)
+            results_clean, _ = classifier.analyze_signal(sig)
             
             self.progress_step.emit("Формирование результатов...")
             self.progress_percent.emit(90)
             
             unified_output = []
-            
-            # В .autoatr сохраняем ТОЛЬКО классификации (без ритмов)
-            # Ритмы будут вычислены эвристически через статический метод в интерфейсе
             for p in results_clean:
                 unified_output.append({
                     'sample': p['sample'], 
